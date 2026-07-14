@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
-import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
+import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, recoverMangledCppName, blankCAttributeMacros } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -3887,6 +3887,50 @@ class APXCharacter {  // the one real definition
       expect(blankCppInlineMacros('x = FORCEINLINE + 1;')).toBe('x = FORCEINLINE + 1;');
       expect(blankCppInlineMacros('int FORCEINLINE_COUNT = 3;')).toBe('int FORCEINLINE_COUNT = 3;');
       expect(blankCppInlineMacros('no macros here')).toBe('no macros here');
+    });
+  });
+
+  describe('C attribute-macro name loss (#1211)', () => {
+    // A macro attribute before a typedef'd return type on a no-arg function
+    // (`LITE_OS_SEC_TEXT_INIT UINT32 LOS_KernelInit(VOID)`) makes tree-sitter
+    // misparse the C declaration: the parameter list `(VOID)` becomes the
+    // declarator and the real name lands in the `type` field, so the function is
+    // indexed as `(VOID)`. Two nets fix it: blankCAttributeMacros blanks a macro
+    // `#define`d in THIS file (recovering both name and return type); when the
+    // macro is only `#include`d (as in real LiteOS), recoverCMisparsedName
+    // salvages the name from the `parenthesized_declarator` misparse.
+    const infoOf = (code: string) =>
+      extractFromSource('t.c', code).nodes
+        .filter((n) => n.kind === 'function' || n.kind === 'method')
+        .map((n) => ({ name: n.name, ret: n.returnType }));
+
+    it('blankCAttributeMacros blanks a local attribute macro, offset-preserving', () => {
+      const inp = '#define SEC_ATTR __attribute__((section(".init")))\nSEC_ATTR int f(void) {}';
+      const out = blankCAttributeMacros(inp);
+      expect(out).toHaveLength(inp.length); // byte offsets preserved
+      expect(out.split('\n')[1]).toBe('         int f(void) {}'); // the leading-attribute use is blanked
+      expect(out).toContain('#define SEC_ATTR __attribute__'); // the #define line itself is untouched
+      // a value use of the macro is left alone; no-macro source is a fast-path no-op
+      expect(blankCAttributeMacros('#define S __attribute__((x))\nint y = S;')).toContain('int y = S;');
+      expect(blankCAttributeMacros('int f(void) {}')).toBe('int f(void) {}');
+    });
+
+    it('recovers name AND return type when the attribute macro is #defined in-file', () => {
+      expect(infoOf(
+        '#define SEC __attribute__((section(".init")))\ntypedef unsigned int U32;\nSEC U32 Foo(VOID) { return 0; }'
+      )).toEqual([{ name: 'Foo', ret: 'U32' }]);
+    });
+
+    it('recovers the name when the macro is only #included (cross-file misparse)', () => {
+      // Return type stays mangled here — a documented limitation; only a local
+      // blank can recover it. The name (the #1211 bug) is what matters.
+      expect(infoOf(
+        'typedef unsigned int U32;\nLITE_OS_SEC_TEXT_INIT U32 LOS_KernelInit(VOID) { return 0; }'
+      )).toEqual([{ name: 'LOS_KernelInit', ret: 'LITE_OS_SEC_TEXT_INIT' }]);
+    });
+
+    it('leaves an ordinary C function untouched', () => {
+      expect(infoOf('int normal(int x) { return x; }').map((n) => n.name)).toEqual(['normal']);
     });
   });
 

@@ -169,9 +169,69 @@ function extractCppReturnType(node: SyntaxNode, source: string): string | undefi
   return normalizeCppReturnType(getNodeText(typeNode, source));
 }
 
+/**
+ * Blank object-like macros defined as an `__attribute__((...))` (e.g. Linux/RTOS
+ * placement macros such as `SEC_ATTR` or OpenHarmony LiteOS-M's
+ * `LITE_OS_SEC_TEXT_INIT`) before tree-sitter parses.
+ *
+ * C has no curated inline-macro blank list (unlike cppExtractor's
+ * blankCppInlineMacros), so an unknown macro in front of a typedef'd return type
+ * on a no-argument function (`SEC_ATTR UINT32 Foo(VOID)`) makes tree-sitter
+ * misparse the declaration: the real name is read as the return type and the
+ * parameter list `(VOID)` becomes the declarator, so the function is indexed as
+ * `(VOID)`; in another shape the name survives but the return type becomes the
+ * macro.
+ *
+ * An attribute macro is a no-op annotation, so replacing it with equal-length
+ * spaces can never remove a type or a name, yet lets the declaration parse as an
+ * ordinary function — recovering BOTH the name and the return type. The macro
+ * set is discovered from the file's own `#define X __attribute__ …` lines, so no
+ * curated list is needed. Offset-preserving (line/column stay exact), mirroring
+ * blankCppExportMacros / blankCppInlineMacros.
+ */
+export function blankCAttributeMacros(source: string): string {
+  const defRe = /^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+__attribute__\b/gm;
+  const names = new Set<string>();
+  for (let m: RegExpExecArray | null; (m = defRe.exec(source)); ) {
+    if (m[1]) names.add(m[1]);
+  }
+  if (names.size === 0) return source;
+  const alt = [...names].sort((a, b) => b.length - a.length).join('|');
+  // Blank the macro only in the leading-attribute position (immediately followed
+  // by a type/name token) and never on its own `#define` line, so a use of the
+  // same macro as a value (`x = SEC_ATTR;`) is left untouched.
+  const useRe = new RegExp(
+    `(?<!#[ \\t]{0,8}define[ \\t]{1,64})\\b(${alt})\\b(?=\\s+[A-Za-z_])`,
+    'g'
+  );
+  return source.replace(useRe, (m) => ' '.repeat(m.length));
+}
+
+/**
+ * Recover a C function name when an *unblanked* attribute macro — e.g. one
+ * `#define`d in a header that this file only `#include`s, so blankCAttributeMacros
+ * never saw the definition — still made tree-sitter misparse
+ * `MACRO <typedef-ret> <name>(VOID)`. In that misparse the real name lands in the
+ * function_definition's `type` field and the parameter list `(VOID)` becomes a
+ * `parenthesized_declarator`. A genuine function definition always has a
+ * `function_declarator`, so a `parenthesized_declarator` declarator is an
+ * unambiguous misparse signature — recover the name from the `type` field.
+ * (The return type is not recoverable here; only blanking the macro fixes that.)
+ */
+export function recoverCMisparsedName(node: SyntaxNode, source: string): string | undefined {
+  if (node.type !== 'function_definition') return undefined;
+  const declarator = getChildByField(node, 'declarator');
+  if (!declarator || declarator.type !== 'parenthesized_declarator') return undefined;
+  const typeNode = getChildByField(node, 'type');
+  return typeNode ? getNodeText(typeNode, source) : undefined;
+}
+
 export const cExtractor: LanguageExtractor = {
-  // CUDA in C-detected headers (content-gated blank; see preParseCSource).
+  // CUDA blanking + attribute-macro blanking for C (see preParseCSource).
   preParse: preParseCSource,
+  // Recover a C name misparsed into `(VOID)` when an attribute macro from an
+  // #included header wasn't blanked at parse time (see recoverCMisparsedName).
+  resolveName: recoverCMisparsedName,
   // Universal net: recover a real name from any macro-mangled function name.
   recoverMangledName: recoverMangledCppName,
   functionTypes: ['function_definition'],
@@ -705,7 +765,10 @@ function preParseCppSource(source: string, filePath?: string): string {
  * `__device__` helpers and kernel prototypes in plain `.h`) get the same
  * content-gated CUDA blank as C++. */
 function preParseCSource(source: string): string {
-  return looksLikeCudaSource(source) ? blankCudaConstructs(source) : source;
+  const cuda = looksLikeCudaSource(source) ? blankCudaConstructs(source) : source;
+  // Blank attribute placement macros (`#define X __attribute__…`) so a macro
+  // before a typedef'd return type can't derail the C declarator parse (#1211).
+  return blankCAttributeMacros(cuda);
 }
 
 export const cppExtractor: LanguageExtractor = {
