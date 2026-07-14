@@ -50,9 +50,10 @@ jobs:
           cat release/SHA256SUMS
 
       - name: Release notes
+        # Generic + version-agnostic: this workflow is reused across releases,
+        # so the per-build specifics (pinned base, patches) live in FORK.md, not here.
         run: |
-          V="${{ steps.ver.outputs.version }}"
-          printf 'FM-Agent maintenance fork build **%s**.\n\nUpstream v1.3.0 + #1211 fix (upstream PR #1223): the C extractor blanks macro attributes before a typedef'"'"'d return type, so functions like `LITE_OS_SEC_TEXT_INIT UINT32 LOS_KernelInit(VOID)` are indexed under their name.\n\nSelf-contained per-OS bundles (darwin/linux, arm64/x64) — no Node or build tools needed. See FORK.md.\n' "$V" > notes.md
+          printf 'FM-Agent maintenance fork of codegraph.\n\nSelf-contained per-OS bundles (mac/linux, arm64/x64) — no Node or build tools needed.\nSee FORK.md for the pinned upstream base and the patches this build carries.\n' > notes.md
           cat notes.md
 
       - name: Create GitHub Release
