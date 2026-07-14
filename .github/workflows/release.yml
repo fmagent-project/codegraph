@@ -8,8 +8,8 @@ name: Release
 #      (no native compilation, so cross-packaging is fine),
 #   3. creates the GitHub Release (tag v<version>) with all archives + SHA256SUMS.
 #
-# Before triggering: bump package.json's version to the target (e.g.
-# 1.3.0-fmagent.N) and make sure the #1211 fix is on this branch.
+# Before triggering: bump package.json's version to the target
+# (X.Y.Z-fmagent.N) and make sure the intended patches are on this branch.
 #
 # Removed vs upstream: npm publish, npmmirror sync, and the CHANGELOG /
 # package-lock auto-commit-and-push steps — this fork distributes only via
