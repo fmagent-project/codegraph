@@ -15,6 +15,7 @@ import {
   FileRecord,
   ExtractionResult,
   ExtractionError,
+  Node,
   Edge,
   UnresolvedReference,
   ReferenceKind,
@@ -22,6 +23,7 @@ import {
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
 import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './parse-pool';
+import { StoreWriter, StoreBundle } from './store-writer';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
@@ -1493,7 +1495,13 @@ export class ExtractionOrchestrator {
     // null in the normal case, or a promise to await (at this safe,
     // between-transactions boundary) when the WAL has outrun the off-thread
     // checkpointer past its hard cap. See db/wal-valve.ts.
-    walBackpressure?: () => Promise<void> | null
+    walBackpressure?: () => Promise<void> | null,
+    // Fresh-DB store offload (perf): when set, per-file store bundles are
+    // applied by a dedicated writer thread instead of the main thread. Only
+    // passed for a COMPLETELY fresh database, where the main thread performs
+    // no reads/writes during the parse loop, so one writer applying bundles
+    // in file order preserves the #1015 determinism exactly.
+    storeWriterOpts?: { dbPath: string; fastInit: boolean } | null
   ): Promise<IndexResult> {
     await initGrammars();
     const startTime = Date.now();
@@ -1604,10 +1612,34 @@ export class ExtractionOrchestrator {
         grammarBuffers,
       });
       log(`Parse worker pool: ${poolSize} worker(s)`);
+      // Bulk index: every core will be needed — spawn the whole pool now so
+      // worker boot overlaps the first read batches instead of trickling in
+      // behind queue-pressure growth.
+      pool.prewarm();
     } else {
       // In-process fallback: load grammars locally and parse on the main thread.
       await loadGrammarsForLanguages(neededLanguages);
     }
+
+    // Dedicated store writer thread (fresh DB only — see the parameter doc).
+    // Same availability rule as the parse pool: needs the compiled worker
+    // (absent when running from source in tests → main-thread fallback).
+    const storeWorkerPath = path.join(__dirname, 'store-worker.js');
+    let storeWriter: StoreWriter | null = null;
+    if (
+      storeWriterOpts &&
+      process.env.CODEGRAPH_NO_STORE_WORKER !== '1' &&
+      fs.existsSync(storeWorkerPath)
+    ) {
+      // Deliberately NOT awaiting ready(): worker_threads delivers messages in
+      // order, so bundles posted while the worker is still booting queue
+      // behind 'open'. A boot failure surfaces at the first drain() — same
+      // propagation point as a store error.
+      storeWriter = new StoreWriter(storeWorkerPath, storeWriterOpts.dbPath, storeWriterOpts.fastInit);
+      log('Store writer thread active');
+    }
+    /** Queue-depth bound for un-acked bundles (bundles hold whole node/edge arrays). */
+    const STORE_WRITER_WINDOW = 64;
 
     /**
      * Parse one file: on the pool when available (the promise REJECTS on a worker
@@ -1655,10 +1687,17 @@ export class ExtractionOrchestrator {
       const bp = walBackpressure?.();
       if (bp) await bp;
 
-      // Store in database on main thread (SQLite is not thread-safe)
+      // Store: on the writer thread when active (fresh DB — bundles applied
+      // in the same file order this chain dispatches them), else on the main
+      // thread (SQLite connections are per-thread).
       if (result.nodes.length > 0 || result.errors.length === 0) {
         const language = detectLanguage(filePath, content, overrides);
-        await this.storeExtractionResult(filePath, content, language, stats, result, commitYield);
+        if (storeWriter) {
+          storeWriter.send(this.buildFreshStoreBundle(filePath, content, language, stats, result));
+          await storeWriter.waitBelow(STORE_WRITER_WINDOW);
+        } else {
+          await this.storeExtractionResult(filePath, content, language, stats, result, commitYield);
+        }
       }
 
       if (result.errors.length > 0) {
@@ -1835,10 +1874,25 @@ export class ExtractionOrchestrator {
     if (!aborted) {
       await Promise.all(inFlight);
       await flushOrdered();
-      if (flushError) throw flushError;
+      if (flushError) {
+        if (storeWriter) await storeWriter.close();
+        throw flushError;
+      }
+      // All bundles are posted; wait for the writer to apply them, then close
+      // its connection BEFORE any main-thread DB work below (retry pass,
+      // resolution) so exactly one connection writes at a time.
+      if (storeWriter) {
+        try {
+          await storeWriter.drain();
+        } finally {
+          await storeWriter.close();
+          storeWriter = null;
+        }
+      }
     }
 
     if (signal?.aborted || aborted) {
+      if (storeWriter) await storeWriter.close();
       if (pool) await pool.destroy();
       return {
         success: false,
@@ -2203,6 +2257,49 @@ export class ExtractionOrchestrator {
     // This prevents FK violations when edges reference nodes that would
     // be silently skipped by insertNode() (see issue #42).
     const validNodes = result.nodes.filter((n) => n.id && n.kind && n.name && n.filePath && n.language);
+    const insertedIds = new Set(validNodes.map((n) => n.id));
+    const validEdges = result.edges.filter(
+      (e) => insertedIds.has(e.source) && insertedIds.has(e.target)
+    );
+    const validRefs = result.unresolvedReferences
+      .filter((ref) => insertedIds.has(ref.fromNodeId))
+      .map((ref) => ({
+        ...ref,
+        filePath: ref.filePath ?? filePath,
+        language: ref.language ?? language,
+      }));
+
+    // Fast path for the common case (everything fits one chunk): the whole
+    // file — nodes, edges, refs, file record — lands in ONE transaction with
+    // no event-loop yields in between. Giant generated files keep the chunked
+    // + yielding path below so the #850 watchdog heartbeat stays serviced.
+    const fitsOneChunk =
+      validNodes.length <= STORE_CHUNK &&
+      validEdges.length <= STORE_CHUNK &&
+      validRefs.length <= STORE_CHUNK;
+    if (fitsOneChunk) {
+      // Snapshot/re-resolution of cross-file incoming edges (below) still runs
+      // for the sync path; on a fresh bulk index crossFileIncomingEdges is [].
+      this.queries.storeFileBundle({
+        nodes: validNodes,
+        edges: validEdges,
+        refs: validRefs,
+        file: {
+          path: filePath,
+          contentHash,
+          language,
+          size: stats.size,
+          modifiedAt: stats.mtimeMs,
+          indexedAt: Date.now(),
+          nodeCount: result.nodes.length,
+          errors: result.errors.length > 0 ? result.errors : undefined,
+        },
+      });
+      if (crossFileIncomingEdges.length > 0) {
+        this.reattachCrossFileEdges(crossFileIncomingEdges, validNodes);
+      }
+      return;
+    }
 
     // Insert nodes (chunked — see STORE_CHUNK above)
     for (let i = 0; i < validNodes.length; i += STORE_CHUNK) {
@@ -2211,11 +2308,7 @@ export class ExtractionOrchestrator {
     }
 
     // Filter edges to only reference nodes that were actually inserted
-    if (result.edges.length > 0) {
-      const insertedIds = new Set(validNodes.map((n) => n.id));
-      const validEdges = result.edges.filter(
-        (e) => insertedIds.has(e.source) && insertedIds.has(e.target)
-      );
+    if (validEdges.length > 0) {
       for (let i = 0; i < validEdges.length; i += STORE_CHUNK) {
         this.queries.insertEdges(validEdges.slice(i, i + STORE_CHUNK));
         await onYield?.();
@@ -2241,43 +2334,13 @@ export class ExtractionOrchestrator {
     // a ref from the target's plain name would strip receiver/qualifier
     // context and risk a rebind a full re-index would never make.
     if (crossFileIncomingEdges.length > 0) {
-      const newNodesByKindName = new Map<string, string>();
-      for (const n of validNodes) {
-        newNodesByKindName.set(`${n.kind}\0${n.name}`, n.id);
-      }
-      const reinserted: Edge[] = [];
-      const resurrected: UnresolvedReference[] = [];
-      for (const e of crossFileIncomingEdges) {
-        const newTargetId = newNodesByKindName.get(`${e.targetKind}\0${e.targetName}`);
-        if (newTargetId) {
-          reinserted.push({ source: e.source, target: newTargetId, kind: e.kind, metadata: e.metadata, line: e.line, column: e.column, provenance: e.provenance });
-        } else {
-          const ref = resurrectRefFromDroppedEdge(e);
-          if (ref) resurrected.push(ref);
-        }
-      }
-      if (reinserted.length > 0) {
-        this.queries.insertEdges(reinserted);
-      }
-      if (resurrected.length > 0) {
-        this.queries.insertUnresolvedRefsBatch(resurrected);
-      }
+      this.reattachCrossFileEdges(crossFileIncomingEdges, validNodes);
     }
 
     // Insert unresolved references in batch with denormalized filePath/language
-    if (result.unresolvedReferences.length > 0) {
-      const insertedIds = new Set(validNodes.map((n) => n.id));
-      const refsWithContext = result.unresolvedReferences
-        .filter((ref) => insertedIds.has(ref.fromNodeId))
-        .map((ref) => ({
-          ...ref,
-          filePath: ref.filePath ?? filePath,
-          language: ref.language ?? language,
-        }));
-      for (let i = 0; i < refsWithContext.length; i += STORE_CHUNK) {
-        this.queries.insertUnresolvedRefsBatch(refsWithContext.slice(i, i + STORE_CHUNK));
-        await onYield?.();
-      }
+    for (let i = 0; i < validRefs.length; i += STORE_CHUNK) {
+      this.queries.insertUnresolvedRefsBatch(validRefs.slice(i, i + STORE_CHUNK));
+      await onYield?.();
     }
 
     // Insert file record
@@ -2292,6 +2355,81 @@ export class ExtractionOrchestrator {
       errors: result.errors.length > 0 ? result.errors : undefined,
     };
     this.queries.upsertFile(fileRecord);
+  }
+
+  /**
+   * Build one file's store bundle for the FRESH-DB path: no existing-file
+   * check, no cross-file edge snapshot (both are re-index concerns — a fresh
+   * database has neither). Filters mirror storeExtractionResult exactly.
+   */
+  private buildFreshStoreBundle(
+    filePath: string,
+    content: string,
+    language: Language,
+    stats: fs.Stats,
+    result: ExtractionResult
+  ): StoreBundle {
+    const validNodes = result.nodes.filter((n) => n.id && n.kind && n.name && n.filePath && n.language);
+    const insertedIds = new Set(validNodes.map((n) => n.id));
+    const validEdges = result.edges.filter(
+      (e) => insertedIds.has(e.source) && insertedIds.has(e.target)
+    );
+    const validRefs = result.unresolvedReferences
+      .filter((ref) => insertedIds.has(ref.fromNodeId))
+      .map((ref) => ({
+        ...ref,
+        filePath: ref.filePath ?? filePath,
+        language: ref.language ?? language,
+      }));
+    return {
+      nodes: validNodes,
+      edges: validEdges,
+      refs: validRefs,
+      file: {
+        path: filePath,
+        contentHash: hashContent(content),
+        language,
+        size: stats.size,
+        modifiedAt: stats.mtimeMs,
+        indexedAt: Date.now(),
+        nodeCount: result.nodes.length,
+        errors: result.errors.length > 0 ? result.errors : undefined,
+      },
+    };
+  }
+
+  /**
+   * Re-attach cross-file incoming edges snapshotted before a re-index delete
+   * (#899): re-resolve each edge's target to the re-indexed node's new id by
+   * (kind, name); targets that vanished are resurrected as their original
+   * unresolved ref (#1240's removal-side counterpart) when the edge carries
+   * its refName stamp.
+   */
+  private reattachCrossFileEdges(
+    crossFileIncomingEdges: Array<Edge & { targetKind: string; targetName: string; sourceFilePath: string; sourceLanguage: Language }>,
+    validNodes: Node[]
+  ): void {
+    const newNodesByKindName = new Map<string, string>();
+    for (const n of validNodes) {
+      newNodesByKindName.set(`${n.kind}\0${n.name}`, n.id);
+    }
+    const reinserted: Edge[] = [];
+    const resurrected: UnresolvedReference[] = [];
+    for (const e of crossFileIncomingEdges) {
+      const newTargetId = newNodesByKindName.get(`${e.targetKind}\0${e.targetName}`);
+      if (newTargetId) {
+        reinserted.push({ source: e.source, target: newTargetId, kind: e.kind, metadata: e.metadata, line: e.line, column: e.column, provenance: e.provenance });
+      } else {
+        const ref = resurrectRefFromDroppedEdge(e);
+        if (ref) resurrected.push(ref);
+      }
+    }
+    if (reinserted.length > 0) {
+      this.queries.insertEdges(reinserted);
+    }
+    if (resurrected.length > 0) {
+      this.queries.insertUnresolvedRefsBatch(resurrected);
+    }
   }
 
   /**

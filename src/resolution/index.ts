@@ -17,7 +17,8 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef } from './import-resolver';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
+import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
@@ -372,6 +373,9 @@ export class ReferenceResolver {
     this.knownNames = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
+    // The import-resolver's per-context memos assume the same stable window
+    // as the caches above — drop them together.
+    if (this.context) clearImportResolverMemos(this.context);
   }
 
   /** `readFile` through the LRU content cache (null = read failed, also cached). */
@@ -1236,7 +1240,10 @@ export class ReferenceResolver {
       } else {
         unresolved.push(ref);
       }
-      await maybeYield();
+      // Fast-path the per-ref yield check: awaiting the async no-op costs a
+      // microtask hop per ref, which dominates at ~10⁵ refs (see MaybeYield).
+      const y = maybeYield();
+      if (y) await y;
     }
 
     return {
@@ -1252,6 +1259,64 @@ export class ReferenceResolver {
   }
 
   /**
+   * Resolve a list of refs and return everything the ADMISSION side needs to
+   * persist the outcome: resolutions, failures, the deferred post-pass refs
+   * this run produced (drained, so the caller owns routing them), and stats.
+   * This is the resolver-worker entry point — it runs the exact per-ref loop
+   * of resolveBatchYielding, minus the main-thread yields (worker threads have
+   * no watchdog heartbeat to starve). Results are in input order.
+   */
+  resolveListForAdmission(refs: UnresolvedReference[]): {
+    resolved: ResolvedRef[];
+    unresolved: UnresolvedRef[];
+    deferredChain: UnresolvedRef[];
+    deferredThisMember: UnresolvedRef[];
+    byMethod: Record<string, number>;
+  } {
+    this.warmCaches();
+    const resolved: ResolvedRef[] = [];
+    const unresolved: UnresolvedRef[] = [];
+    const byMethod: Record<string, number> = {};
+    for (const raw of refs) {
+      const ref: UnresolvedRef = {
+        fromNodeId: raw.fromNodeId,
+        referenceName: raw.referenceName,
+        referenceKind: raw.referenceKind,
+        line: raw.line,
+        column: raw.column,
+        filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
+        language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
+        rowId: raw.rowId,
+      };
+      const result = this.resolveOne(ref);
+      if (result) {
+        resolved.push(result);
+        byMethod[result.resolvedBy] = (byMethod[result.resolvedBy] || 0) + 1;
+      } else {
+        unresolved.push(ref);
+      }
+    }
+    return {
+      resolved,
+      unresolved,
+      deferredChain: this.deferredChainRefs.splice(0),
+      deferredThisMember: this.deferredThisMemberRefs.splice(0),
+      byMethod,
+    };
+  }
+
+  /**
+   * Re-queue deferred post-pass refs produced by resolver workers, preserving
+   * their admission order so resolveChainedCallsViaConformance /
+   * resolveDeferredThisMemberRefs process them exactly as the sequential path
+   * would have.
+   */
+  appendDeferredFromWorkers(deferredChain: UnresolvedRef[], deferredThisMember: UnresolvedRef[]): void {
+    this.deferredChainRefs.push(...deferredChain);
+    this.deferredThisMemberRefs.push(...deferredThisMember);
+  }
+
+  /**
    * Resolve and persist in batches to keep memory bounded.
    * Processes unresolved references in chunks, persisting edges and cleaning
    * up resolved refs after each batch to avoid accumulating large arrays.
@@ -1259,7 +1324,12 @@ export class ReferenceResolver {
   async resolveAndPersistBatched(
     onProgress?: (current: number, total: number) => void,
     batchSize: number = 5000,
-    onSynthesisProgress?: (done: number, total: number) => void
+    onSynthesisProgress?: (done: number, total: number) => void,
+    // When provided, big batches fan out across a read-only resolver-worker
+    // pool with results admitted in canonical order (see resolver-pool.ts).
+    // Sequential fallback on any pool failure. CODEGRAPH_NO_PARALLEL_RESOLVE=1
+    // disables entirely.
+    parallel?: { dbPath: string }
   ): Promise<ResolutionResult> {
     // Resolution runs on the indexer's MAIN thread, and the #850 liveness
     // watchdog SIGKILLs a process whose event loop stalls past its window (60s
@@ -1280,16 +1350,59 @@ export class ReferenceResolver {
       byMethod: {} as Record<string, number>,
     };
 
+    // Parallel pool, started immediately but never awaited up front: early
+    // batches run sequentially while the workers boot (module load + readonly
+    // DB open + framework detect + cache warm ≈ hundreds of ms), and the loop
+    // switches to fan-out the moment the pool reports ready — so pool boot
+    // costs zero wall-clock. Any failure downgrades to sequential permanently.
+    let pool: ResolverPool | null = null;
+    let poolReady = false;
+    if (parallel && total >= minRefsForPool()) {
+      pool = ResolverPool.tryCreate(parallel.dbPath, this.projectRoot);
+      pool?.ready().then(
+        () => { poolReady = true; },
+        () => { void pool?.destroy().catch(() => undefined); pool = null; }
+      );
+    }
+
     // Process in batches. We always read from offset 0 because every ref the
     // batch processed leaves the pending set (resolved rows are deleted,
     // unresolvable ones flip to status='failed'), shifting the remaining
     // pending rows forward.
     let prevRemaining = Number.POSITIVE_INFINITY;
+    try {
     while (true) {
       const batch = this.queries.getUnresolvedReferencesBatch(0, batchSize);
       if (batch.length === 0) break;
 
-      const result = await this.resolveBatchYielding(batch, maybeYield);
+      let result: ResolutionResult;
+      if (pool && poolReady && ResolverPool.worthParallel(batch.length)) {
+        try {
+          const out = await pool.resolveBatch(batch);
+          // Deferred post-pass refs ride back from the workers; re-queue them
+          // in admission order so the post-passes see the sequential order.
+          this.appendDeferredFromWorkers(out.deferredChain, out.deferredThisMember);
+          result = {
+            resolved: out.resolved,
+            unresolved: out.unresolved,
+            stats: {
+              total: batch.length,
+              resolved: out.resolved.length,
+              unresolved: out.unresolved.length,
+              byMethod: out.byMethod,
+            },
+          };
+        } catch (err) {
+          logDebug('Parallel resolution failed; falling back to sequential', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+          await pool.destroy().catch(() => undefined);
+          pool = null;
+          result = await this.resolveBatchYielding(batch, maybeYield);
+        }
+      } else {
+        result = await this.resolveBatchYielding(batch, maybeYield);
+      }
 
       // Persist in bounded sub-transactions with yields between: a whole
       // batch's edge insert / keyed deletes are otherwise one solid
@@ -1369,6 +1482,9 @@ export class ReferenceResolver {
       const remaining = this.queries.getUnresolvedReferencesCount();
       if (remaining >= prevRemaining) break;
       prevRemaining = remaining;
+    }
+    } finally {
+      if (pool) await pool.destroy().catch(() => undefined);
     }
 
     // Dynamic-edge synthesis: now that all base `calls` edges are persisted,

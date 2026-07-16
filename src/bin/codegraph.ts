@@ -28,6 +28,15 @@
 // otherwise blinds the PPID watchdog forever (#1185) — see early-ppid.ts.
 import '../mcp/early-ppid';
 
+// Persist V8 compile artifacts across runs (Node ≥22.8). Every invocation —
+// and every worker thread, which re-requires the whole extraction module
+// graph — skips recompiling unchanged sources. Worth hundreds of ms of
+// worker-boot latency per bulk index; harmless no-op when unavailable.
+try {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  (require('node:module') as { enableCompileCache?: () => void }).enableCompileCache?.();
+} catch { /* cache is best-effort */ }
+
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';

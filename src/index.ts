@@ -55,6 +55,7 @@ import { deriveProjectNameTokens } from './search/query-utils';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
+import { minRefsForPool } from './resolution/resolver-pool';
 
 // Re-export types for consumers
 export * from './types';
@@ -445,7 +446,21 @@ export class CodeGraph {
       // the final fold-up before the interval is restored in the finally.
       // Kill switch: CODEGRAPH_NO_WAL_DEFER=1. Non-WAL journal modes (some
       // network filesystems) have no WAL to defer — skip.
-      const deferWal = process.env.CODEGRAPH_NO_WAL_DEFER !== '1' && this.db.getJournalMode() === 'wal';
+      // Fast-init: on a COMPLETELY fresh DB, trade crash-durability for speed
+      // during the bulk build (journal in memory, no fsync). Safe because the
+      // DB is disposable until the index completes — index_state stays
+      // 'indexing' and a crashed init is re-run from scratch; existing DBs
+      // (re-index/sync) never take this path. Kill switch:
+      // CODEGRAPH_NO_FAST_INIT=1 (same pattern as CODEGRAPH_NO_WAL_DEFER).
+      const freshDb = this.queries.getNodeAndEdgeCount().nodes === 0;
+      const fastInit = process.env.CODEGRAPH_NO_FAST_INIT !== '1' && freshDb;
+      if (fastInit) {
+        try {
+          this.db.getDb().pragma('journal_mode = MEMORY');
+          this.db.getDb().pragma('synchronous = OFF');
+        } catch { /* keep WAL */ }
+      }
+      const deferWal = !fastInit && process.env.CODEGRAPH_NO_WAL_DEFER !== '1' && this.db.getJournalMode() === 'wal';
       let walValve: WalCheckpointValve | null = null;
       let priorAutocheckpoint = 1000;
       if (deferWal) {
@@ -470,12 +485,25 @@ export class CodeGraph {
         // path as every file (re-)indexes below — so a full index is also the
         // orphan-cleanup pass for names deleted since the last one.
         try { this.queries.clearNameSegmentVocab(); } catch { /* vocab is advisory — never fail an index over it */ }
-        const result = await this.orchestrator.indexAll(
-          options.onProgress,
-          options.signal,
-          options.verbose,
-          walValve ? () => walValve!.backpressure() : undefined
-        );
+        // Bulk FTS mode for the mass-insert phase: drop the per-row FTS sync
+        // triggers, rebuild nodes_fts once from the nodes table afterwards.
+        // Crash inside the window is healed on the next DatabaseConnection.open.
+        this.db.beginBulkNodeLoad();
+        let result: IndexResult;
+        try {
+          result = await this.orchestrator.indexAll(
+            options.onProgress,
+            options.signal,
+            options.verbose,
+            walValve ? () => walValve!.backpressure() : undefined,
+            // Store-writer offload is fresh-DB-only: with any pre-existing
+            // data the store path must read (existing-file checks, cross-file
+            // edge snapshots) and delete, which belongs on one thread.
+            freshDb ? { dbPath: this.db.getPath(), fastInit } : null
+          );
+        } finally {
+          this.db.endBulkNodeLoad();
+        }
 
         // Fold the parse phase's WAL BEFORE the first post-parse reads
         // (resolver re-init and resolution both read on the main thread):
@@ -502,6 +530,19 @@ export class CodeGraph {
         if (result.success && result.filesIndexed > 0) {
           // Get count without loading all refs into memory
           const unresolvedCount = this.queries.getUnresolvedReferencesCount();
+
+          // Fast-init leaves the DB in memory-journal (rollback) mode, where
+          // the parallel resolver pool's read connections would contend with
+          // the main writer's exclusive commits. When the pool will actually
+          // run (enough pending refs), restore WAL BEFORE resolution so
+          // readers never block the writer; otherwise stay in the fast mode
+          // until the finally — sequential resolution has no readers.
+          if (fastInit && unresolvedCount >= minRefsForPool()) {
+            try {
+              this.db.getDb().pragma('synchronous = NORMAL');
+              this.db.getDb().pragma('journal_mode = WAL');
+            } catch { /* keep current mode; resolution still works sequentially */ }
+          }
 
           options.onProgress?.({
             phase: 'resolving',
@@ -618,6 +659,14 @@ export class CodeGraph {
         if (walValve) { walValve.stop(); await walValve.drain(); }
         if (deferWal) {
           try { this.db.setWalAutocheckpoint(priorAutocheckpoint); } catch { /* connection may be closing */ }
+        }
+        if (fastInit) {
+          // Back to the durable defaults; journal_mode=WAL folds the MEMORY
+          // journal state into a normal WAL-mode database file.
+          try {
+            this.db.getDb().pragma('synchronous = NORMAL');
+            this.db.getDb().pragma('journal_mode = WAL');
+          } catch { /* connection may be closing */ }
         }
         this.fileLock.release();
       }
@@ -1032,7 +1081,9 @@ export class CodeGraph {
     onProgress?: (current: number, total: number) => void,
     onSynthesisProgress?: (done: number, total: number) => void
   ): Promise<ResolutionResult> {
-    return this.resolver.resolveAndPersistBatched(onProgress, undefined, onSynthesisProgress);
+    return this.resolver.resolveAndPersistBatched(onProgress, undefined, onSynthesisProgress, {
+      dbPath: this.db.getPath(),
+    });
   }
 
   /**

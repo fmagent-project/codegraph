@@ -55,7 +55,74 @@ export function isNixPathImportRef(ref: UnresolvedRef): boolean {
 /**
  * Resolve an import path to an actual file
  */
+// Per-context memos for the two hottest pure lookups on the resolution path:
+// import-specifier → file resolution and exported-symbol lookup. Both are pure
+// given a stable file set + node table, which is exactly the window between
+// ReferenceResolver.clearCaches() calls — clearImportResolverMemos() is invoked
+// there, so the staleness discipline matches the resolver's own caches.
+const importPathMemos = new WeakMap<ResolutionContext, Map<string, string | null>>();
+const exportedSymbolMemos = new WeakMap<ResolutionContext, Map<string, Node | undefined>>();
+
+/**
+ * Per-file index of exported symbols, replacing repeated linear `.find`s over
+ * `getNodesInFile` arrays (a barrel-heavy repo scans its biggest files once
+ * per referencing symbol otherwise). First-wins insertion preserves exactly
+ * the array-order semantics of the `.find` calls it replaces.
+ */
+interface FileExportIndex {
+  byName: Map<string, Node>;
+  defaultComponent: Node | undefined;
+  defaultFnClass: Node | undefined;
+}
+const fileExportIndexes = new WeakMap<ResolutionContext, Map<string, FileExportIndex>>();
+
+function getFileExportIndex(filePath: string, context: ResolutionContext): FileExportIndex {
+  let perFile = fileExportIndexes.get(context);
+  if (!perFile) {
+    perFile = new Map();
+    fileExportIndexes.set(context, perFile);
+  }
+  let idx = perFile.get(filePath);
+  if (!idx) {
+    idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined };
+    for (const n of context.getNodesInFile(filePath)) {
+      if (!n.isExported) continue;
+      if (!idx.byName.has(n.name)) idx.byName.set(n.name, n);
+      if (idx.defaultComponent === undefined && n.kind === 'component') idx.defaultComponent = n;
+      if (idx.defaultFnClass === undefined && (n.kind === 'function' || n.kind === 'class')) idx.defaultFnClass = n;
+    }
+    perFile.set(filePath, idx);
+  }
+  return idx;
+}
+
+/** Drop the per-context memo tables (see ReferenceResolver.clearCaches). */
+export function clearImportResolverMemos(context: ResolutionContext): void {
+  importPathMemos.delete(context);
+  exportedSymbolMemos.delete(context);
+  fileExportIndexes.delete(context);
+}
+
 export function resolveImportPath(
+  importPath: string,
+  fromFile: string,
+  language: Language,
+  context: ResolutionContext
+): string | null {
+  let memo = importPathMemos.get(context);
+  if (!memo) {
+    memo = new Map();
+    importPathMemos.set(context, memo);
+  }
+  const key = `${language}\0${fromFile}\0${importPath}`;
+  const hit = memo.get(key);
+  if (hit !== undefined || memo.has(key)) return hit ?? null;
+  const resolved = resolveImportPathUncached(importPath, fromFile, language, context);
+  memo.set(key, resolved);
+  return resolved;
+}
+
+function resolveImportPathUncached(
   importPath: string,
   fromFile: string,
   language: Language,
@@ -1973,11 +2040,44 @@ function findExportedSymbol(
   visited: Set<string>,
   depth = 0
 ): Node | undefined {
+  // Memoize fresh (top-level) lookups only: recursive re-export steps carry a
+  // populated `visited` set, whose contents change the reachable answer.
+  // Every ref to the same imported symbol repeats this exact walk, so the
+  // top-level memo removes the re-export chase + per-file linear scans from
+  // all but the first occurrence.
+  if (depth === 0 && visited.size === 0) {
+    let memo = exportedSymbolMemos.get(context);
+    if (!memo) {
+      memo = new Map();
+      exportedSymbolMemos.set(context, memo);
+    }
+    const key = `${filePath}\0${want.isDefault ? 1 : 0}${want.isNamespace ? 1 : 0}\0${want.exportedName}\0${want.memberName ?? ''}\0${language}`;
+    if (memo.has(key)) return memo.get(key);
+    const result = findExportedSymbolWalk(filePath, want, language, context, visited, depth);
+    memo.set(key, result);
+    return result;
+  }
+  return findExportedSymbolWalk(filePath, want, language, context, visited, depth);
+}
+
+function findExportedSymbolWalk(
+  filePath: string,
+  want: {
+    isDefault: boolean;
+    isNamespace: boolean;
+    exportedName: string;
+    memberName: string | null;
+  },
+  language: Language,
+  context: ResolutionContext,
+  visited: Set<string>,
+  depth: number
+): Node | undefined {
   if (depth > REEXPORT_MAX_DEPTH) return undefined;
   if (visited.has(filePath)) return undefined;
   visited.add(filePath);
 
-  const nodesInFile = context.getNodesInFile(filePath);
+  const exportIndex = getFileExportIndex(filePath, context);
 
   // 1. Direct hit: the symbol is declared in this file.
   if (want.isDefault) {
@@ -1987,21 +2087,13 @@ function findExportedSymbol(
     // `.ts`/`.tsx` `export default fn`/`class` case. Without the component
     // branch, an `export { default as X } from './X.svelte'` barrel never
     // resolves and the component shows a false 0 callers (#629).
-    const direct =
-      nodesInFile.find((n) => n.isExported && n.kind === 'component') ??
-      nodesInFile.find(
-        (n) => n.isExported && (n.kind === 'function' || n.kind === 'class')
-      );
+    const direct = exportIndex.defaultComponent ?? exportIndex.defaultFnClass;
     if (direct) return direct;
   } else if (want.isNamespace && want.memberName) {
-    const direct = nodesInFile.find(
-      (n) => n.name === want.memberName && n.isExported
-    );
+    const direct = exportIndex.byName.get(want.memberName);
     if (direct) return direct;
   } else {
-    const direct = nodesInFile.find(
-      (n) => n.name === want.exportedName && n.isExported
-    );
+    const direct = exportIndex.byName.get(want.exportedName);
     if (direct) return direct;
   }
 
