@@ -42,15 +42,16 @@ them are the ORIGINAL plan and carry expectations that measurement later correct
       commit** (the integration-branch exception — 9 milestone commits preserved),
       main tip `c1dc78d`. Suite green pre-merge (2,472 passed / 4 skipped,
       `CODEGRAPH_KERNEL_EXPECT=1`).
-- [ ] **O2. Windows VM validation** — IN PROGRESS 2026-07-17: maintainer started the
-      VM; guest repo at `c1dc78d`, rustc 1.97.1 (aarch64-pc-windows-msvc) via
-      rustup, MSVC Build Tools (VCTools workload + VC.Tools.ARM64 + Win11 SDK)
-      installing via **scheduled task** — Windows sshd kills detached children on
-      session close, `schtasks` is the survival pattern. Remaining: `bash
-      scripts/build-kernel.sh`, `npm ci`+build, kernel suites with
-      `CODEGRAPH_KERNEL_EXPECT=1`. Close before the first release that ships
-      prebuilds (fallback makes a broken win32 .node safe — Windows silently gets
-      wasm — but safe ≠ validated).
+- [x] **O2. Windows VM validation** — DONE 2026-07-17. Guest (ARM64 Win11):
+      rustc 1.97.1 aarch64-pc-windows-msvc + MSVC Build Tools (VCTools workload +
+      VC.Tools.ARM64 + Win11 SDK; installed via **scheduled task** — Windows sshd
+      kills detached children on session close, `schtasks` is the survival
+      pattern). `build-kernel.sh --target aarch64-pc-windows-msvc` builds native
+      win32-arm64 in ~2min; **all three kernel suites green with
+      `CODEGRAPH_KERNEL_EXPECT=1` (33/33)**. The leg EARNED ITS KEEP: the guest's
+      autocrlf checkout exposed a real CRLF parity bug (docstring cleaning; JS
+      multiline `^` anchors after `\r` — §0a traps) — fixed + CRLF fixtures pinned
+      cross-platform in #1329. Every prebuild target platform is now validated.
 - [ ] **P1. Kernel-scale resolution speed** (§7a) — measurement round RUN 2026-07-17
       and it RESHAPED the arc (full record §7a.1): the "sequential at 2 CPUs"
       premise was FALSE (pool sizing is cpuset-blind; R6 already ran 6 workers),
