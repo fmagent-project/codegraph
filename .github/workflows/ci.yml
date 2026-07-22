@@ -1,0 +1,40 @@
+name: CI
+
+# The fork's value is being able to cut a reliable release when it matters, so
+# gate every PR (and main) on the pieces a release depends on: a clean install,
+# the TypeScript build, and a real native Linux kernel build validated by the
+# kernel walker-parity suites.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-kernel:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - run: npm ci
+
+      - name: TypeScript build
+        run: npm run build
+
+      - name: Build native kernel (linux-x64)
+        run: |
+          bash scripts/build-kernel.sh --target x86_64-unknown-linux-gnu
+          ls -R codegraph-kernel/prebuilds
+
+      - name: Kernel contract + walker-parity gate
+        # Fail if the native kernel is missing or diverges from the reference
+        # walker — CODEGRAPH_KERNEL_EXPECT=1 turns a missing binary into an error.
+        run: CODEGRAPH_KERNEL_EXPECT=1 npx vitest run __tests__/kernel-*.test.ts
