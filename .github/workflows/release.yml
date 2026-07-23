@@ -1,20 +1,21 @@
 name: Release
 
-# FM-Agent maintenance fork — trimmed from upstream's release workflow.
+# FM-Agent maintenance fork — trimmed from upstream v1.5.0's release workflow.
 #
-# Manually triggered ("Run workflow"). On trigger it:
-#   1. reads the version from package.json,
-#   2. builds a self-contained bundle for mac + linux (arm64/x64) on one runner
-#      (no native compilation, so cross-packaging is fine),
-#   3. creates the GitHub Release (tag v<version>) with all archives + SHA256SUMS.
+# Manually triggered ("Run workflow") from the `main` branch only. On trigger it:
+#   1. builds the native Rust extraction kernel per platform (the `kernel`
+#      matrix, unchanged from upstream — required as of 1.5.0),
+#   2. bundles a self-contained per-OS archive (mac/linux/windows, arm64/x64),
+#   3. creates the GitHub Release (tag v<version>) pinned to the built commit,
+#      with all archives + SHA256SUMS.
 #
 # Before triggering: bump package.json's version to the target
 # (X.Y.Z-fmagent.N) and make sure the intended patches are on this branch.
 #
-# Removed vs upstream: npm publish, npmmirror sync, and the CHANGELOG /
-# package-lock auto-commit-and-push steps — this fork distributes only via
-# GitHub Releases and never pushes back to a protected branch, so no RELEASE_PAT
-# or NPM_TOKEN secret is needed.
+# Removed vs upstream: npm publish, npmmirror sync, build-provenance attestation,
+# and the CHANGELOG / package-lock auto-commit-and-push steps — this fork
+# distributes only via GitHub Releases and never pushes back to a protected
+# branch, so no RELEASE_PAT / NPM_TOKEN / OIDC secret is needed.
 on:
   workflow_dispatch: {}
 
@@ -22,23 +23,88 @@ permissions:
   contents: write   # create the GitHub Release + tag
 
 jobs:
+  # Native extraction-kernel prebuilds — REQUIRED as of 1.5.0 (the kernel is the
+  # release's headline, not an optional extra). Each leg builds its platform's
+  # codegraph-kernel.node natively; the vendored-grammar-C languages
+  # (kotlin/lua/scala/dart) compile parser.c via the cc crate, so each runner
+  # needs its platform C toolchain (the GitHub runner images ship one, plus
+  # rustup; build-kernel.sh adds each cross target itself). Unchanged from upstream.
+  kernel:
+    # Only cut releases from main — guards against dispatching from a stray branch.
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+          - runner: ubuntu-22.04 # oldest glibc runner → widest compatibility
+            targets: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            targets: aarch64-unknown-linux-gnu
+          - runner: windows-latest
+            targets: x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build kernel prebuilds
+        shell: bash
+        run: |
+          for t in ${{ matrix.targets }}; do
+            bash scripts/build-kernel.sh --target "$t"
+          done
+          ls -R codegraph-kernel/prebuilds
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ matrix.runner }}
+          path: codegraph-kernel/prebuilds/
+          if-no-files-found: error
+
   release:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    needs: kernel
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: 22
-
       - run: npm ci
+      - name: Ensure zip/unzip
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zip unzip
 
       - name: Resolve version
         id: ver
         run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
-      - name: Build platform bundles (mac + linux)
+      - name: Download kernel prebuilds
+        # All legs are required (see the kernel job), so every target's
+        # <target>/codegraph-kernel.node must be present in release/kernel/.
+        uses: actions/download-artifact@v4
+        with:
+          pattern: kernel-*
+          merge-multiple: true
+          path: release/kernel/
+
+      - name: Kernel contract + walker-parity gate
+        # Runs the kernel test suites against the freshly built linux-x64 .node,
+        # so a broken native build fails the release instead of shipping silently.
         run: |
-          for t in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+          if [ -f release/kernel/linux-x64/codegraph-kernel.node ]; then
+            mkdir -p codegraph-kernel/prebuilds/linux-x64
+            cp release/kernel/linux-x64/codegraph-kernel.node codegraph-kernel/prebuilds/linux-x64/
+            CODEGRAPH_KERNEL_EXPECT=1 npx vitest run __tests__/kernel-*.test.ts
+          else
+            echo "::error::linux-x64 kernel prebuild missing despite required matrix"
+            exit 1
+          fi
+
+      - name: Build all platform bundles
+        # Packaging only (no native compilation): each bundle wraps the JS
+        # launcher + the platform's prebuilt kernel .node, so one runner can
+        # assemble every OS's archive.
+        run: |
+          for t in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64 win32-arm64; do
             bash scripts/build-bundle.sh "$t"
           done
           ls -lh release
@@ -50,10 +116,8 @@ jobs:
           cat release/SHA256SUMS
 
       - name: Release notes
-        # Generic + version-agnostic: this workflow is reused across releases,
-        # so the per-build specifics (pinned base, patches) live in FORK.md, not here.
         run: |
-          printf 'FM-Agent maintenance fork of codegraph.\n\nSelf-contained per-OS bundles (mac/linux, arm64/x64) — no Node or build tools needed.\nSee FORK.md for the pinned upstream base and the patches this build carries.\n' > notes.md
+          printf 'FM-Agent maintenance fork of codegraph (base: upstream v1.5.0).\n\nSelf-contained per-OS bundles (mac/linux/windows, arm64/x64) carrying the native Rust extraction kernel.\nSee FORK.md for the pinned base and the fork policy.\n' > notes.md
           cat notes.md
 
       - name: Create GitHub Release
@@ -61,9 +125,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="v${{ steps.ver.outputs.version }}"
-          # Idempotent: create the release once, otherwise (re-run) refresh assets.
+          # Idempotent: create once, otherwise (re-run) refresh assets.
+          # --target pins the tag to the commit these artifacts were built from,
+          # so a main that advanced during the matrix build can't leave the tag
+          # and the bundles sourced from different commits.
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" release/codegraph-* release/SHA256SUMS --clobber
           else
-            gh release create "$TAG" release/codegraph-* release/SHA256SUMS --title "$TAG" --notes-file notes.md
+            gh release create "$TAG" release/codegraph-* release/SHA256SUMS \
+              --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md
           fi
