@@ -961,6 +961,7 @@ program
           nodeCount: stats.nodeCount,
           edgeCount: stats.edgeCount,
           dbSizeBytes: stats.dbSizeBytes,
+          walSizeBytes: stats.walSizeBytes,
           backend,
           journalMode,
           nodesByKind: stats.nodesByKind,
@@ -1017,6 +1018,19 @@ program
       console.log(`  Nodes:     ${formatNumber(stats.nodeCount)}`);
       console.log(`  Edges:     ${formatNumber(stats.edgeCount)}`);
       console.log(`  DB Size:   ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`);
+      // Surface the WAL sidecar (#1431): a WAL that dwarfs the DB at rest is
+      // the killed-session leak — invisible before this line, it only showed
+      // up as a mysteriously full disk. open() above already kicked off the
+      // automatic heal for the oversized case.
+      if (stats.walSizeBytes > 0) {
+        const { WAL_HEAL_THRESHOLD_BYTES } = await import('../db/index');
+        const oversized = stats.walSizeBytes > Math.max(WAL_HEAL_THRESHOLD_BYTES, stats.dbSizeBytes);
+        const walLabel = `${(stats.walSizeBytes / 1024 / 1024).toFixed(2)} MB`;
+        console.log(`  WAL Size:  ${oversized ? chalk.yellow(walLabel) : walLabel}`);
+        if (oversized) {
+          warn('The write-ahead log is larger than the database — killed sessions left it behind. It is reclaimed automatically on open; if it persists across runs, another live CodeGraph process is holding it.');
+        }
+      }
       // Surface the active SQLite backend (node:sqlite — Node's built-in real
       // SQLite, full WAL + FTS5, no native build).
       const backendLabel = chalk.green(`node:sqlite ${getGlyphs().dash} built-in (full WAL)`);
@@ -1117,10 +1131,10 @@ program
       // Mirror the MCP search down-rank so the CLI also surfaces the
       // hand-written implementation before protobuf/gRPC scaffolding
       // when both share a name. See extraction/generated-detection.ts.
-      const { isGeneratedFile } = await import('../extraction/generated-detection');
+      const isGen = cg.generatedFilePredicate(rawResults.map((r) => r.node.filePath));
       const results = [...rawResults].sort((a, b) => {
-        const aGen = isGeneratedFile(a.node.filePath) ? 1 : 0;
-        const bGen = isGeneratedFile(b.node.filePath) ? 1 : 0;
+        const aGen = isGen(a.node.filePath) ? 1 : 0;
+        const bGen = isGen(b.node.filePath) ? 1 : 0;
         return aGen - bGen;
       });
 
@@ -2232,7 +2246,7 @@ program
  */
 program
   .command('install')
-  .description('Install codegraph MCP server into one or more agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent)')
+  .description('Install codegraph MCP server into one or more agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, GitHub Copilot)')
   .option('-t, --target <ids>', 'Target agent(s): comma-separated ids, or "auto"|"all"|"none". Default: prompt')
   .option('-l, --location <where>', 'Install location: "global" or "local". Default: prompt')
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=auto, auto-allow on')
@@ -2332,7 +2346,7 @@ program
  */
 program
   .command('uninstall')
-  .description('Remove codegraph from your agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent)')
+  .description('Remove codegraph from your agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, GitHub Copilot)')
   .option('-t, --target <ids>', 'Target agent(s): comma-separated ids, or "all". Default: all')
   .option('-l, --location <where>', 'Uninstall location: "global" or "local". Default: prompt')
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=all')
