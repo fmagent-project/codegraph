@@ -196,6 +196,14 @@ const DEFAULT_IGNORE_DIRS: ReadonlySet<string> = new Set([
   '__history', '__recovery',
   // Generic cache
   '.cache',
+  // FORK-SPECIFIC (see FORK.md): FM-Agent's work directory. It holds one copy of
+  // every function FM-Agent extracts from the project, plus the scripts it stages
+  // to produce them, so indexing it lists each function twice and mixes tool code
+  // in with project code. Unlike the entries above, this name is not from the
+  // github/gitignore templates and could plausibly be real source — which is why
+  // it stays fork-only. A project that does own an `fm_agent/` directory opts back
+  // in with a `.gitignore` negation (`!fm_agent/`), as for any default-ignored dir.
+  'fm_agent',
 ]);
 
 /**
