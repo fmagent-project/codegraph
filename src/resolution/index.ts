@@ -1119,6 +1119,10 @@ export class ReferenceResolver {
           // tooling label "callback registration" and lets validation diff
           // exactly the edges this feature added.
           ...(ref.original.referenceKind === 'function_ref' ? { fnRef: true } : {}),
+          // A bare-name ref elected among K same-named METHODS by proximity —
+          // a heuristic guess a type-aware consumer may want to re-check (see
+          // ResolvedRef.methodCandidates / CODEGRAPH_STRICT_METHOD_RESOLUTION).
+          ...(ref.methodCandidates ? { methodCandidates: ref.methodCandidates } : {}),
         },
       };
     });

@@ -43,6 +43,12 @@ export interface ResolvedRef {
   confidence: number;
   /** How it was resolved */
   resolvedBy: 'exact-match' | 'import' | 'qualified-name' | 'framework' | 'fuzzy' | 'instance-method' | 'file-path' | 'function-ref';
+  /** Set when a bare-name ref was elected among K same-named METHODS by
+   * file/directory proximity — a heuristic guess, not a typed resolution.
+   * Consumers that derive facts from `calls` edges can re-check these with
+   * their own receiver typing (or index under
+   * CODEGRAPH_STRICT_METHOD_RESOLUTION=1, which declines them instead). */
+  methodCandidates?: number;
 }
 
 /**

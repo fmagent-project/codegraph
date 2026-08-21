@@ -433,6 +433,35 @@ export function matchByExactName(
     return null;
   }
 
+  // A METHOD's identity is decided by its receiver's type, and a bare-name
+  // ref means the resolver has lost (or never had) that receiver. With SEVERAL
+  // same-named methods, file/directory proximity is a heuristic stand-in: it
+  // is what makes a monorepo's per-app `UserService.findAll` resolve to the
+  // right app (#764), and it is also what resolved Rust's
+  // `(*uptr).assume_init_mut().queue.init()` — extracted as plain `init` — to
+  // the neighboring `ProcessManager::init` instead of `slinkedlist`'s
+  // `StaticLinkedList::init`, feeding a verification pipeline a wrong edge.
+  // Which trade is right depends on the consumer, so both are supported:
+  //   * default: elect by proximity as before, but SAY SO — the edge metadata
+  //     carries `methodCandidates: K`, so a consumer that can re-check the
+  //     receiver's type knows this edge was a guess among K;
+  //   * CODEGRAPH_STRICT_METHOD_RESOLUTION=1: decline instead — the ref stays
+  //     unresolved ("unknown" rather than a confident wrong answer), for
+  //     consumers that derive facts from `calls` edges and have their own
+  //     type-aware resolution to re-add what they can prove.
+  // A UNIQUE name still resolves via the single-candidate branch above, and
+  // receiver-bearing refs resolve through matchMethodCall's typed strategies —
+  // both unchanged in both modes.
+  const sameLangCandidates = candidates.filter((c) => c.language === ref.language);
+  const methodPool = sameLangCandidates.length > 0 ? sameLangCandidates : candidates;
+  const ambiguousMethods =
+    methodPool.length > 1 && methodPool.every((c) => c.kind === 'method')
+      ? methodPool.length
+      : 0;
+  if (ambiguousMethods && process.env.CODEGRAPH_STRICT_METHOD_RESOLUTION === '1') {
+    return null;
+  }
+
   // Multiple matches - try to narrow down
   const bestMatch = findBestMatch(ref, candidates, context);
   if (bestMatch) {
@@ -444,6 +473,7 @@ export function matchByExactName(
       targetNodeId: bestMatch.id,
       confidence,
       resolvedBy: 'exact-match',
+      ...(ambiguousMethods ? { methodCandidates: ambiguousMethods } : {}),
     };
   }
 
