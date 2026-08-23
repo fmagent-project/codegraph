@@ -15,14 +15,21 @@ Upstream shipped the C macro-attribute extraction fix (issue #1211, PR #1311) in
 v1.5.0, so the base carries it natively; the fork no longer needs its own patch
 for it.
 
-**Patches:** one, listed below. Apart from it the tree matches the pinned base, so
-the fork stays cheap to re-sync. Every patch lives as a merged pull request here
+**Patches:** two, listed below. Apart from them the tree matches the pinned base,
+so the fork stays cheap to re-sync. Every patch lives as a merged pull request here
 and must be **re-applied on each upstream sync** — if a merge drops one, this list
 is what catches it.
 
 | File | Patch |
 |------|-------|
 | `src/extraction/index.ts` | `fm_agent` added to `DEFAULT_IGNORE_DIRS`. FM-Agent writes its work directory into the project it analyses, holding one copy of every function it extracts plus the scripts staged to produce them, so indexing it lists each function twice and mixes tool code in with project code. Upstream deliberately keeps names that could be real source out of that list, so this stays fork-only; a project that does own an `fm_agent/` directory opts back in with a `.gitignore` negation (`!fm_agent/`). |
+| `__tests__/fm-agent-workdir-exclusion.test.ts` | Regression cover for the patch above, so a sync that drops or widens it fails `npm test` instead of shipping. Pins four things: the exclusion applies at the root and at any depth; it is a whole-name match, so `fm_agent_data/` and `my_fm_agent/` stay indexed; a `.gitignore` negation takes the directory back; and none of it depends on git. |
+
+A sync brings new upstream test files in on its own — they are separate files, so
+git takes them without asking. The case to watch for is upstream *moving* the test
+tree or changing how the runner discovers it: our file would stay where it is, quietly
+stop being collected, and nothing would fail. Check the suite's file count after a
+sync, not just that it is green.
 
 **Version marker:** `codegraph --version` → `1.5.0-fmagent.N` identifies a build
 from this fork. Note this is a SemVer pre-release of `1.5.0`, so it sorts *below*
