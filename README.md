@@ -388,6 +388,7 @@ The installer **wires up your agents only — it does not index your code.** Aft
 
 ```bash
 codegraph install --yes                              # auto-detect agents, install global
+codegraph install --yes --init                       # same, then build the current project's index (one-shot bootstrap)
 codegraph install --target=cursor,claude --yes       # explicit target list
 codegraph install --target=auto --location=local     # detected agents, project-local
 codegraph install --target=copilot-vscode,copilot-cli,copilot-jetbrains --yes  # GitHub Copilot everywhere
@@ -400,6 +401,7 @@ codegraph install --print-config copilot-vscode      # same, for Copilot in VS C
 | `--target` | `auto`, `all`, `none`, or csv (`claude,cursor,...`) | prompt |
 | `--location` | `global`, `local` | prompt |
 | `--yes` | (boolean) | prompt every step |
+| `--init` | (boolean) run `codegraph init` in the current directory after wiring agents | — |
 | `--no-permissions` | (boolean) skip Claude auto-allow list | permissions on |
 | `--print-config <id>` | dump snippet for one agent and exit | — |
 
@@ -414,7 +416,7 @@ cd your-project
 codegraph init
 ```
 
-Builds the per-project knowledge graph index, which then auto-syncs on every file change. A single global `codegraph install` works in every project you open — no need to re-run the installer per project.
+Builds the per-project knowledge graph index, which then auto-syncs on every file change. A single global `codegraph install` works in every project you open — no need to re-run the installer per project. Add `--yes` to skip every prompt (scripts / CI / container bootstraps).
 
 That's it — your agent will use CodeGraph tools automatically when a `.codegraph/` directory exists.
 
@@ -668,6 +670,26 @@ only revives embedded git repos, not plain source):
 CodeGraph discovers those files off disk, overriding `.gitignore`, on index,
 sync, and watch. An explicit `exclude` still wins, and built-in skips
 (`node_modules`, `dist`, `.git`) are never re-included.
+
+Sometimes a directory shouldn't leave the index — you still want to find things
+in it — it just shouldn't *outrank* your real code. A `scripts/` or
+`optional-skills/` tree whose helpers use generic names (`usage`, `status`,
+`run`) can win on an exact name match and crowd out the product code that
+actually answers the query. Name those trees under `deprioritize`:
+
+```json
+{
+  "deprioritize": ["optional-skills/", "scripts/"]
+}
+```
+
+This is the ranking counterpart to `exclude`: those paths stay indexed and
+findable — searching for them directly still works — they just stop winning
+against first-party code. It applies to `query` / `search` and to `explore`'s
+ranking. It is *not* a filter: unlike the built-in `example/`, `sample/`,
+`fixture/`, `benchmark/` and `demo/` handling — which also drops those files
+from some result sets outright — `deprioritize` only ever changes rank. Reach
+for `exclude` when you want something gone.
 
 ### Custom file extensions
 
