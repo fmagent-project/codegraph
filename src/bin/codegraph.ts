@@ -405,6 +405,16 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
     for (const w of result.errors.filter((e) => e.code === 'index_partial')) {
       clack.log.warn(w.message);
     }
+    // Files salvaged from comment-stripped source after repeated parser
+    // failures are indexed but possibly incomplete — say so here, or the run
+    // reads as fully clean and the index quietly disagrees with a later
+    // re-parse of the same bytes (#1565).
+    const salvaged = result.errors.filter((e) => e.code === 'salvaged_stripped');
+    if (salvaged.length > 0) {
+      const sample = salvaged.slice(0, 3).map((e) => e.filePath).filter(Boolean).join(', ');
+      const more = salvaged.length > 3 ? ', ...' : '';
+      clack.log.warn(`${formatNumber(salvaged.length)} file(s) indexed from comment-stripped source after repeated parse failures ${getGlyphs().dash} symbols may be incomplete (${sample}${more})`);
+    }
   } else if (hasErrors) {
     clack.log.error(`Indexing failed ${getGlyphs().dash} all ${formatNumber(result.filesErrored)} files had errors`);
   } else {
@@ -443,9 +453,16 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
       clack.log.info(`The index is fully usable ${getGlyphs().dash} only the failed files are missing.`);
     }
   } else if (projectPath) {
-    const logPath = path.join(getCodeGraphDir(projectPath), 'errors.log');
-    if (fs.existsSync(logPath)) {
-      fs.unlinkSync(logPath);
+    // No hard errors. Salvaged-file warnings still belong in the log — it
+    // carries the per-file detail behind the one-line summary above.
+    if (result.errors.some((e) => e.code === 'salvaged_stripped')) {
+      writeErrorLog(projectPath, result.errors);
+      clack.log.info('See .codegraph/errors.log for details');
+    } else {
+      const logPath = path.join(getCodeGraphDir(projectPath), 'errors.log');
+      if (fs.existsSync(logPath)) {
+        fs.unlinkSync(logPath);
+      }
     }
   }
 }
@@ -590,6 +607,100 @@ async function recordIndexTelemetry(
 // =============================================================================
 
 /**
+ * The `init` flow — shared by `codegraph init` and `codegraph install --init`
+ * (#1578): refuse an unsafe root, create `.codegraph/`, build the initial
+ * index under supervision, then the post-index offers. `yes` makes every
+ * offer non-interactive (defaults only), so a container / CI bootstrap never
+ * blocks on a prompt. An unsafe root sets `process.exitCode = 1` and returns
+ * (no `--force` is implied by any caller); an index failure exits 1.
+ */
+async function runInit(
+  projectPath: string,
+  options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean },
+): Promise<void> {
+  const clack = await importESM('@clack/prompts');
+
+  clack.intro('Initializing CodeGraph');
+
+  try {
+    // Refuse to index your home directory / a filesystem root — it pulls in
+    // caches, other projects, and your whole tree (a multi-GB index + watcher
+    // churn, and on pre-1.0 macOS a machine-crashing fd blowup, #845).
+    const unsafe = unsafeIndexRootReason(projectPath);
+    if (unsafe && !options.force) {
+      clack.log.error(`Refusing to initialize in ${projectPath} — it looks like ${unsafe}.`);
+      clack.log.info('Run this inside a specific project directory, or pass --force if you really mean to index everything under it.');
+      clack.outro('');
+      process.exitCode = 1;
+      return;
+    }
+
+    if (isInitialized(projectPath)) {
+      clack.log.warn(`Already initialized in ${projectPath}`);
+      clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
+      try {
+        const { offerWatchFallback } = await import('../installer');
+        await offerWatchFallback(clack, projectPath, { yes: options.yes });
+      } catch { /* non-fatal */ }
+      clack.outro('');
+      return;
+    }
+
+    const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
+    const cg = await CodeGraph.init(projectPath, { index: false });
+    clack.log.success(`Initialized in ${projectPath}`);
+
+    // Indexing runs by default now. The legacy -i/--index flag is still
+    // accepted (so existing muscle memory and scripts don't break) but is a
+    // no-op — initializing always builds the initial index.
+    // Supervise the index: self-terminate if orphaned or wedged (#999).
+    // The DB + WAL paths let the liveness watchdog tell a slow store on
+    // degraded storage from a true wedge (#1231).
+    // A closure so we can re-run the exact same supervised, progress-rendered
+    // index if the user opts gitignored child repos in below (#1156).
+    const dbPath = getDatabasePath(projectPath);
+    const runIndex = async (): Promise<IndexResult> => {
+      const supervision = installCommandSupervision('init', { progressPaths: [dbPath, `${dbPath}-wal`] });
+      try {
+        if (options.verbose) {
+          return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
+        }
+        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+        const progress = createShimmerProgress();
+        const r = await cg.indexAll({ onProgress: progress.onProgress });
+        await progress.stop();
+        return r;
+      } finally {
+        supervision.stop();
+      }
+    };
+    const result = await runIndex();
+    printIndexResult(clack, result, projectPath);
+    await recordIndexTelemetry(cg, result);
+
+    // An empty graph at a git super-repo usually means `.gitignore` excludes
+    // the child repos that hold the code — surface them and offer to opt in
+    // rather than leaving the user with a silent 0-node "Done". (#1156)
+    // Under --yes the offer prints its one-line opt-in snippet instead of
+    // prompting (same as a non-TTY run).
+    if (result.nodesCreated === 0) {
+      await offerIndexIgnoredRepos(clack, projectPath, runIndex, { interactive: !options.yes });
+    }
+
+    try {
+      const { offerWatchFallback } = await import('../installer');
+      await offerWatchFallback(clack, projectPath, { yes: options.yes });
+    } catch { /* non-fatal */ }
+
+    clack.outro('Done');
+    cg.destroy();
+  } catch (err) {
+    clack.log.error(`Failed: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+
+/**
  * codegraph init [path]
  */
 program
@@ -598,86 +709,9 @@ program
   .option('-i, --index', 'Deprecated: indexing now runs by default; flag accepted for backward compatibility')
   .option('-f, --force', 'Initialize even if the path looks like your home directory or a filesystem root')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean }) => {
-    const projectPath = path.resolve(pathArg || process.cwd());
-    const clack = await importESM('@clack/prompts');
-
-    clack.intro('Initializing CodeGraph');
-
-    try {
-      // Refuse to index your home directory / a filesystem root — it pulls in
-      // caches, other projects, and your whole tree (a multi-GB index + watcher
-      // churn, and on pre-1.0 macOS a machine-crashing fd blowup, #845).
-      const unsafe = unsafeIndexRootReason(projectPath);
-      if (unsafe && !options.force) {
-        clack.log.error(`Refusing to initialize in ${projectPath} — it looks like ${unsafe}.`);
-        clack.log.info('Run this inside a specific project directory, or pass --force if you really mean to index everything under it.');
-        clack.outro('');
-        process.exitCode = 1;
-        return;
-      }
-
-      if (isInitialized(projectPath)) {
-        clack.log.warn(`Already initialized in ${projectPath}`);
-        clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
-        try {
-          const { offerWatchFallback } = await import('../installer');
-          await offerWatchFallback(clack, projectPath);
-        } catch { /* non-fatal */ }
-        clack.outro('');
-        return;
-      }
-
-      const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
-      const cg = await CodeGraph.init(projectPath, { index: false });
-      clack.log.success(`Initialized in ${projectPath}`);
-
-      // Indexing runs by default now. The legacy -i/--index flag is still
-      // accepted (so existing muscle memory and scripts don't break) but is a
-      // no-op — initializing always builds the initial index.
-      // Supervise the index: self-terminate if orphaned or wedged (#999).
-      // The DB + WAL paths let the liveness watchdog tell a slow store on
-      // degraded storage from a true wedge (#1231).
-      // A closure so we can re-run the exact same supervised, progress-rendered
-      // index if the user opts gitignored child repos in below (#1156).
-      const dbPath = getDatabasePath(projectPath);
-      const runIndex = async (): Promise<IndexResult> => {
-        const supervision = installCommandSupervision('init', { progressPaths: [dbPath, `${dbPath}-wal`] });
-        try {
-          if (options.verbose) {
-            return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
-          }
-          process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-          const progress = createShimmerProgress();
-          const r = await cg.indexAll({ onProgress: progress.onProgress });
-          await progress.stop();
-          return r;
-        } finally {
-          supervision.stop();
-        }
-      };
-      const result = await runIndex();
-      printIndexResult(clack, result, projectPath);
-      await recordIndexTelemetry(cg, result);
-
-      // An empty graph at a git super-repo usually means `.gitignore` excludes
-      // the child repos that hold the code — surface them and offer to opt in
-      // rather than leaving the user with a silent 0-node "Done". (#1156)
-      if (result.nodesCreated === 0) {
-        await offerIndexIgnoredRepos(clack, projectPath, runIndex, { interactive: true });
-      }
-
-      try {
-        const { offerWatchFallback } = await import('../installer');
-        await offerWatchFallback(clack, projectPath);
-      } catch { /* non-fatal */ }
-
-      clack.outro('Done');
-      cg.destroy();
-    } catch (err) {
-      clack.log.error(`Failed: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    }
+  .option('-y, --yes', 'Non-interactive: skip every prompt and take the defaults (for scripts / CI / container bootstraps)')
+  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean }) => {
+    await runInit(path.resolve(pathArg || process.cwd()), options);
   });
 
 /**
@@ -1217,6 +1251,65 @@ program
   });
 
 /**
+ * codegraph context <task...>
+ *
+ * The CLI face of the public `buildContext` API (ContextBuilder): FTS entry
+ * points + graph expansion + code blocks, formatted as markdown or JSON.
+ * Advertised in the usage header since the first release but never actually
+ * registered (#1611); external integrations (e.g. Memorix) invoke it as
+ * `codegraph context --path <root> --format json --max-nodes 8 --no-code <task>`.
+ */
+program
+  .command('context <task...>')
+  .description('Build context for a task: relevant symbols, relationships, and code blocks')
+  .option('-p, --path <path>', 'Project path')
+  .option('-f, --format <format>', 'Output format: markdown or json', 'markdown')
+  .option('-n, --max-nodes <number>', 'Maximum number of symbols to include')
+  .option('--no-code', 'Omit code blocks (structure only)')
+  .action(async (taskParts: string[], options: { path?: string; format?: string; maxNodes?: string; code?: boolean }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    const format = options.format ?? 'markdown';
+    if (format !== 'markdown' && format !== 'json') {
+      error(`Unknown format "${options.format}" — use "markdown" or "json".`);
+      process.exit(1);
+    }
+    let maxNodes: number | undefined;
+    if (options.maxNodes !== undefined) {
+      maxNodes = parseInt(options.maxNodes, 10);
+      if (Number.isNaN(maxNodes) || maxNodes < 1) {
+        error(`--max-nodes expects a positive integer, got "${options.maxNodes}".`);
+        process.exit(1);
+      }
+    }
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+
+      const result = await cg.buildContext(taskParts.join(' '), {
+        format,
+        includeCode: options.code !== false,
+        ...(maxNodes !== undefined ? { maxNodes } : {}),
+      });
+
+      // Both supported formats return a formatted string; print it verbatim so
+      // `--format json` stays machine-parseable on stdout (error()/warnings go
+      // to stderr only).
+      console.log(typeof result === 'string' ? result : JSON.stringify(result, null, 2));
+      cg.destroy();
+    } catch (err) {
+      error(`Context build failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
  * codegraph prompt-hook  (hidden)
  *
  * A Claude Code `UserPromptSubmit` hook entry point. Reads `{prompt, cwd}` JSON
@@ -1691,10 +1784,10 @@ program
   .aliases(['daemons'])
   .description('Manage running CodeGraph background daemons — pick one and press enter to stop it')
   .action(async () => {
-    const { listDaemons, stopDaemonAt, stopAllDaemons } = await import('../mcp/daemon-registry');
+    const { listVerifiedDaemons, stopDaemonAt, stopAllDaemons } = await import('../mcp/daemon-registry');
     const { runDaemonPicker } = await import('../mcp/daemon-manager');
 
-    const daemons = listDaemons();
+    const daemons = await listVerifiedDaemons();
     if (daemons.length === 0) {
       info('No CodeGraph daemons running.');
       return;
@@ -1717,7 +1810,7 @@ program
     const clack = await importESM('@clack/prompts');
     clack.intro('CodeGraph daemons');
     await runDaemonPicker({
-      list: listDaemons,
+      list: listVerifiedDaemons,
       stop: stopDaemonAt,
       stopAll: stopAllDaemons,
       cwdRoot,
@@ -1823,14 +1916,15 @@ program
       }
 
       const lockPath = path.join(getCodeGraphDir(projectPath), 'codegraph.lock');
-
-      if (!fs.existsSync(lockPath)) {
-        info(`No lock file found ${getGlyphs().dash} nothing to do`);
-        return;
+      let removed = false;
+      if (fs.existsSync(lockPath)) {
+        fs.unlinkSync(lockPath);
+        removed = true;
       }
-
-      fs.unlinkSync(lockPath);
-      success('Removed lock file. You can now run indexing again.');
+      const { clearStaleDaemonArtifacts } = await import('../mcp/daemon-registry');
+      removed = await clearStaleDaemonArtifacts(projectPath) || removed;
+      if (removed) success('Removed stale lock artifacts. You can now run indexing again.');
+      else info(`No stale lock files found ${getGlyphs().dash} nothing to do`);
     } catch (err) {
       error(`Failed to remove lock: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
@@ -2250,6 +2344,7 @@ program
   .option('-t, --target <ids>', 'Target agent(s): comma-separated ids, or "auto"|"all"|"none". Default: prompt')
   .option('-l, --location <where>', 'Install location: "global" or "local". Default: prompt')
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=auto, auto-allow on')
+  .option('-i, --init', 'After wiring agents, also run `codegraph init` in the current directory — builds this project’s index, so install + index is one command (combine with --yes for an unattended bootstrap)')
   .option('--no-permissions', 'Skip writing the auto-allow permissions list (Claude Code only)')
   .option('--print-config <id>', 'Print MCP config snippet for the named agent and exit (no file writes)')
   .option('--refresh', 'Rewrite what previous installs configured, for already-configured agents only (never adds new ones). Run automatically by `codegraph upgrade`')
@@ -2257,6 +2352,7 @@ program
     target?: string;
     location?: string;
     yes?: boolean;
+    init?: boolean;
     permissions?: boolean;
     printConfig?: string;
     refresh?: boolean;
@@ -2333,6 +2429,18 @@ program
     } catch (err) {
       error(err instanceof Error ? err.message : String(err));
       process.exit(1);
+    }
+
+    // --init: the one-shot "wire agents AND build this project's index"
+    // bootstrap (#1578). The installer itself never indexes implicitly (a
+    // surprise index of $HOME is the thing we refuse) — an explicit flag is
+    // the user choosing. Runs after a successful install, including the
+    // `--target none` / nothing-detected case (the installer returns normally
+    // there), and shares every guard with `codegraph init`: an unsafe root
+    // is refused (exit 1, no implied --force), an already-initialized
+    // project just says so. `--yes` flows through so no offer prompts.
+    if (opts.init) {
+      await runInit(process.cwd(), { yes: opts.yes });
     }
   });
 

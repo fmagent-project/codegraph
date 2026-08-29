@@ -3,13 +3,15 @@
 FM-Agent's maintenance fork of
 [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph).
 
-**Pinned base:** upstream `main` at `c6aaa20358cd6adcd04b87bdef8e5803ad146f3a`
-(2026-08-07). That is *past* `v1.5.0` and before whatever upstream tags next:
-`v1.5.0` was 104 commits behind, and the incremental-sync convergence work, the
-first-class `union` nodes and the WAL growth fix in between all matter to how
-FM-Agent reads the graph. The version marker keeps saying `1.5.0-fmagent.N`
-because it is the last upstream *release* this descends from — the exact base is
-this commit.
+**Pinned base:** upstream `v1.6.0` (2026-08-26) — a tagged release, as the policy
+below prefers. It carries fixes for the three issues reported upstream from this
+project since the previous base: Rust field-receiver resolution
+([#1585](https://github.com/colbymchenry/codegraph/issues/1585)), generic `impl`
+ownership ([#1588](https://github.com/colbymchenry/codegraph/issues/1588)) and
+Erlang per-arity identity
+([#1610](https://github.com/colbymchenry/codegraph/issues/1610)). The previous
+base was `c6aaa20` (upstream `main`, 2026-08-07), 27 commits behind this tag; see
+issue #10 for the full rationale of this sync.
 
 Upstream shipped the C macro-attribute extraction fix (issue #1211, PR #1311) in
 v1.5.0, so the base carries it natively; the fork no longer needs its own patch
@@ -31,9 +33,9 @@ tree or changing how the runner discovers it: our file would stay where it is, q
 stop being collected, and nothing would fail. Check the suite's file count after a
 sync, not just that it is green.
 
-**Version marker:** `codegraph --version` → `1.5.0-fmagent.N` identifies a build
-from this fork. Note this is a SemVer pre-release of `1.5.0`, so it sorts *below*
-plain `1.5.0`; the updater must therefore point at this fork (see below), never
+**Version marker:** `codegraph --version` → `1.6.0-fmagent.N` identifies a build
+from this fork. Note this is a SemVer pre-release of `1.6.0`, so it sorts *below*
+plain `1.6.0`; the updater must therefore point at this fork (see below), never
 upstream, or it would advertise a "downgrade to upstream" as an upgrade.
 
 **All install/upgrade entry points point at this fork,** so a fork install never

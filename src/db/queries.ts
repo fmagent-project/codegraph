@@ -56,6 +56,23 @@ function isLowValueFile(filePath: string, generated?: ReadonlySet<string>): bool
 const SQLITE_PARAM_CHUNK_SIZE = 500;
 
 /**
+ * How much of the exact-name bonus a `deprioritize`d path keeps (#982). Damped
+ * rather than zeroed: a query that genuinely targets that tree must still rank
+ * it, the same "discount, don't erase" rule the path penalty follows.
+ *
+ * Derived rather than picked. `nameMatchBonus`'s prefix arm tops out below
+ * `10 + 30 = 40`, and a de-prioritized node also takes the -15 path penalty, so
+ * `80 * SCALE - 15 > 40` is what stops a damped WHOLE-QUERY exact match from
+ * losing to a mere prefix match. 0.75 clears it (45). Measured on a 62k-node
+ * django index: at 0.25 that invariant breaks in practice — `child`, `parent`
+ * and `method` lose rank 1 to `children`, `all_parents` and `method_decorator`
+ * — while crowd-out removal is almost flat between 0.75 and 0.5 (39 vs 40 of 88
+ * peripheral top-10 slots cleared), so a deeper discount buys little and costs
+ * the invariant. Pinned by a test.
+ */
+export const DEPRIORITIZED_NAME_BONUS_SCALE = 0.75;
+
+/**
  * Database row types (snake_case from SQLite)
  */
 interface NodeRow {
@@ -128,8 +145,11 @@ interface UnresolvedRefRow {
  * refs against newly-added node names.
  */
 function referenceNameTail(referenceName: string): string {
-  const idx = Math.max(referenceName.lastIndexOf('.'), referenceName.lastIndexOf(':'));
-  return idx >= 0 ? referenceName.slice(idx + 1) : referenceName;
+  // Erlang refs carry a written arity (`f/1`, `mod::fn/2` — #1610); the tail a
+  // new symbol's plain name could match is the arity-less function name.
+  const base = referenceName.replace(/\/\d{1,3}$/, '') || referenceName;
+  const idx = Math.max(base.lastIndexOf('.'), base.lastIndexOf(':'));
+  return idx >= 0 ? base.slice(idx + 1) : base;
 }
 
 /**
@@ -204,6 +224,7 @@ export class QueryBuilder {
   // whole project, not a symbol, so it carries no discriminative signal (#720).
   // Set once by the CodeGraph instance; empty by default (no down-weighting).
   private projectNameTokens: Set<string> = new Set();
+  private isDeprioritizedPath: ((filePath: string) => boolean) | undefined;
 
   // Node cache for frequently accessed nodes (LRU-style, max 1000 entries)
   private nodeCache: Map<string, Node> = new Map();
@@ -326,6 +347,21 @@ export class QueryBuilder {
   /** The normalized project-name tokens (#720); empty if none were derived. */
   getProjectNameTokens(): Set<string> {
     return this.projectNameTokens;
+  }
+
+  /**
+   * Set the predicate that marks a path as de-prioritized by the project's
+   * `codegraph.json` `deprioritize` patterns (#982). Ranking-only: those paths
+   * stay indexed and findable, they just stop outranking first-party code.
+   * Called once when the project opens; undefined disables the lever.
+   */
+  setDeprioritizedPathMatcher(matcher: ((filePath: string) => boolean) | undefined): void {
+    this.isDeprioritizedPath = matcher;
+  }
+
+  /** The `deprioritize` predicate (#982), so other rankers apply the same lever. */
+  getDeprioritizedPathMatcher(): ((filePath: string) => boolean) | undefined {
+    return this.isDeprioritizedPath;
   }
 
   // ===========================================================================
@@ -1168,15 +1204,26 @@ export class QueryBuilder {
   }
 
   /**
-   * Get nodes by lowercase name match (uses idx_nodes_lower_name expression index)
+   * Get nodes by name, case-insensitively (seeks the idx_nodes_lower_name
+   * expression index).
+   *
+   * The parameter is lowered in SQL rather than trusted to arrive lowered, so
+   * the lookup means the same thing whatever casing a caller hands it. Written
+   * as a bare `lower(name) = ?` it silently returned nothing for any input
+   * carrying an uppercase letter, and — because SQLite's `lower()` folds ASCII
+   * only while JavaScript's `.toLowerCase()` folds Unicode — a caller that
+   * pre-lowered in JavaScript could not match a non-ASCII name at all.
+   *
+   * Note this hardens the query, not its one caller: `matchFuzzy` still lowers
+   * in JavaScript before calling, so the non-ASCII gap remains open there.
    */
-  getNodesByLowerName(lowerName: string): Node[] {
+  getNodesByLowerName(name: string): Node[] {
     if (!this.stmts.getNodesByLowerName) {
       this.stmts.getNodesByLowerName = this.db.prepare(
-        'SELECT * FROM nodes WHERE lower(name) = ?'
+        'SELECT * FROM nodes WHERE lower(name) = lower(?)'
       );
     }
-    const rows = this.stmts.getNodesByLowerName.all(lowerName) as NodeRow[];
+    const rows = this.stmts.getNodesByLowerName.all(name) as NodeRow[];
     return rows.map(rowToNode);
   }
 
@@ -1242,12 +1289,25 @@ export class QueryBuilder {
     // pushing them past the FTS fetch limit before post-hoc scoring can help.
     // Use the max BM25 score as the base so the nameMatchBonus (exact=30 vs
     // prefix=20) actually differentiates them after rescoring.
+    //
+    // Whole-name equality MUST be written as `lower(name) = lower(?)` so it
+    // seeks `idx_nodes_lower_name`. The equivalent `name = ? COLLATE NOCASE`
+    // matches no index — `idx_nodes_name` is BINARY-collated and the expression
+    // index only matches the same expression — and degrades to a full table
+    // scan. The `LIMIT 20` does not rescue it: SQLite can only stop early once
+    // it has produced 20 rows, and this runs once per query term, most of which
+    // name nothing in the corpus. Measured per term on an unmatched term:
+    // 0.08ms on gin (2.5k nodes), 0.39ms on excalidraw (11k), 2.4ms on django
+    // (62k) — and growing with the corpus, where the seek is flat at ~0.002ms.
+    // Lowering the parameter in SQL rather than in JS is deliberate: SQLite's
+    // `lower()` and NOCASE both fold ASCII only, while JS `.toLowerCase()`
+    // folds Unicode, which would silently stop matching non-ASCII names.
     if (results.length > 0 && query) {
       const existingIds = new Set(results.map(r => r.node.id));
       const maxFtsScore = Math.max(...results.map(r => r.score));
       const terms = query.split(/\s+/).filter(t => t.length >= 2);
       for (const term of terms) {
-        let sql = 'SELECT * FROM nodes WHERE name = ? COLLATE NOCASE';
+        let sql = 'SELECT * FROM nodes WHERE lower(name) = lower(?)';
         const params: (string | number)[] = [term];
         if (kinds && kinds.length > 0) {
           sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
@@ -1271,13 +1331,24 @@ export class QueryBuilder {
     // Apply multi-signal scoring
     if (results.length > 0 && (text || query)) {
       const scoringQuery = text || query;
-      results = results.map(r => ({
-        ...r,
-        score: r.score
-          + kindBonus(r.node.kind)
-          + scorePathRelevance(r.node.filePath, scoringQuery, this.projectNameTokens)
-          + nameMatchBonus(r.node.name, scoringQuery),
-      }));
+      results = results.map(r => {
+        // A path the project de-prioritized is saying its symbol NAMES are not
+        // the answer, so the exact-name bonus has to be damped too. The -15 path
+        // penalty alone cannot do it: the bonus is additive and larger (measured
+        // on #982's repro, a `usage()` helper sat at 74.8 vs 51.2 for the top
+        // product symbol — -15 lands at 59.8, still ahead). Damped, not zeroed,
+        // so the tree stays findable when it genuinely is what you asked for.
+        // Evaluated once and reused: the predicate stats the config file.
+        const deprioritized = this.isDeprioritizedPath?.(r.node.filePath) ?? false;
+        const nameBonus = nameMatchBonus(r.node.name, scoringQuery);
+        return {
+          ...r,
+          score: r.score
+            + kindBonus(r.node.kind)
+            + scorePathRelevance(r.node.filePath, scoringQuery, this.projectNameTokens, deprioritized)
+            + (deprioritized ? Math.round(nameBonus * DEPRIORITIZED_NAME_BONUS_SCALE) : nameBonus),
+        };
+      });
       results.sort((a, b) => b.score - a.score);
       // Trim to requested limit after rescoring
       if (results.length > limit) {
@@ -1547,9 +1618,16 @@ export class QueryBuilder {
     // Pass 2: Query each name, boosting results that co-locate with distinctive symbols.
 
     // Pass 1: Find files containing each queried name, identify distinctive names
+    //
+    // Both passes spell whole-name equality as `lower(name) = lower(?)` so they
+    // seek `idx_nodes_lower_name` — see the note in `searchNodes` for why the
+    // `name = ? COLLATE NOCASE` form full-scans instead. This path is the one
+    // that hurts most: it runs both passes for every symbol extracted from the
+    // query, and extraction is generous, so most of those names are absent from
+    // the corpus and never reach either LIMIT.
     const nameToFiles = new Map<string, Set<string>>();
     for (const name of names) {
-      let sql = 'SELECT DISTINCT file_path FROM nodes WHERE name COLLATE NOCASE = ?';
+      let sql = 'SELECT DISTINCT file_path FROM nodes WHERE lower(name) = lower(?)';
       const params: (string | number)[] = [name];
       if (kinds && kinds.length > 0) {
         sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
@@ -1577,7 +1655,7 @@ export class QueryBuilder {
       let sql = `
         SELECT nodes.*, 1.0 as score
         FROM nodes
-        WHERE name COLLATE NOCASE = ?
+        WHERE lower(name) = lower(?)
       `;
       const params: (string | number)[] = [name];
 
@@ -2359,7 +2437,12 @@ export class QueryBuilder {
       const chunkRows = this.db
         .prepare(`SELECT * FROM unresolved_refs WHERE status = 'pending' AND file_path IN (${placeholders})`)
         .all(...chunk) as UnresolvedRefRow[];
-      rows.push(...chunkRows);
+      // Append with a loop, never a spread: the INPUT chunk is bounded, but
+      // the RESULT rows per chunk are not — a dense recovery sync (e.g. the
+      // #1541 self-heal re-indexing hundreds of files) returns more rows than
+      // V8 allows as arguments, and `push(...chunkRows)` dies with "Maximum
+      // call stack size exceeded", aborting resolution mid-sync (#1558).
+      for (const row of chunkRows) rows.push(row);
     }
 
     return rows.map((row) => ({
@@ -2541,7 +2624,10 @@ export class QueryBuilder {
       const chunkRows = this.db
         .prepare(`SELECT * FROM unresolved_refs WHERE status = 'failed' AND name_tail IN (${placeholders})`)
         .all(...chunk) as UnresolvedRefRow[];
-      rows.push(...chunkRows);
+      // Loop, not spread — same V8 argument-limit hazard as
+      // getUnresolvedReferencesByFiles (#1558): a large definition delta can
+      // select an unbounded number of failed rows per chunk.
+      for (const row of chunkRows) rows.push(row);
     }
 
     return rows.map((row) => ({

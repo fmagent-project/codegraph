@@ -53,8 +53,10 @@ import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
+import ignore from 'ignore';
+import { loadDeprioritizePatterns } from './project-config';
 import { CodeGraphPackageVersion } from './mcp/version';
-import { segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
+import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
 import { minRefsForPool } from './resolution/resolver-pool';
 
@@ -186,6 +188,39 @@ export class CodeGraph {
     } catch {
       // Best-effort: ranking still works without it.
     }
+    // Down-weight the peripheral trees the project named in `codegraph.json`
+    // `deprioritize` — indexed and findable, but never outranking real code
+    // (#982). Ranking-only, so a bad pattern costs relevance, never recall.
+    //
+    // Read LAZILY, not once here: `wireLayers` runs from the constructor and
+    // from `reopenIfReplaced`, so a matcher built here would freeze at whatever
+    // the config said when the project opened. The MCP server caches one
+    // CodeGraph per root for its whole lifetime, so editing `codegraph.json`
+    // would appear to do nothing until the process restarted — `exclude` and
+    // `include` do not behave that way. `loadDeprioritizePatterns` is
+    // mtime-cached, so this costs one `stat`; the compiled matcher is memoized
+    // on the pattern array's identity, which the cache keeps stable.
+    let cachedPatterns: string[] | undefined;
+    let cachedMatcher: ReturnType<typeof ignore> | undefined;
+    this.queries.setDeprioritizedPathMatcher((filePath: string): boolean => {
+      try {
+        const patterns = loadDeprioritizePatterns(this.projectRoot);
+        if (patterns.length === 0) return false;
+        if (patterns !== cachedPatterns) {
+          cachedPatterns = patterns;
+          cachedMatcher = ignore().add(patterns);
+        }
+        const rel = path.isAbsolute(filePath)
+          ? path.relative(this.projectRoot, filePath)
+          : filePath;
+        if (!rel || rel.startsWith('..')) return false;
+        return cachedMatcher!.ignores(rel.split(path.sep).join('/'));
+      } catch {
+        // Ranking must never take the search down with it.
+        return false;
+      }
+    });
+
     this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
     this.resolver = createResolver(this.projectRoot, this.queries);
     this.graphManager = new GraphQueryManager(this.queries);
@@ -975,6 +1010,14 @@ export class CodeGraph {
             await this.rebuildNameSegmentVocab();
           }
         } catch { /* vocab is advisory — never fail a sync over it */ }
+
+        // A killed full index leaves this marker at `indexing`. Sync repairs
+        // missing files, pending refs, and (on open) dropped indexes, so a
+        // successful recovery must also close the metadata state (#1556).
+        const fullReconcile = !options.paths || options.paths.length === 0;
+        if (fullReconcile && this.getIndexState() === 'indexing') {
+          try { this.queries.setMetadata('index_state', 'complete'); } catch { /* advisory */ }
+        }
 
         return result;
       } finally {
@@ -1823,7 +1866,23 @@ export class CodeGraph {
     query: string,
     options?: FindRelevantContextOptions
   ): Promise<Subgraph> {
-    return this.contextBuilder.findRelevantContext(query, options);
+    // Segment-vocab supplement: FTS keeps camelCase names as single tokens,
+    // so a word-level query ("auto-scroll to bottom") can never reach
+    // `pinFeedIfNearBottom` through search alone. Resolve the query's words
+    // against name_segment_vocab (same precision rules as the prompt hook:
+    // co-occurrence, else rare singles, verified against live nodes) and hand
+    // the names down as dampened exact-name seeds. Callers that pass their
+    // own seedNames keep them; failures degrade to no supplement.
+    let seedNames = options?.seedNames;
+    if (seedNames === undefined) {
+      try {
+        seedNames = this.getSegmentMatches(extractSegmentSearchWords(query), 8)
+          .map((m) => m.name);
+      } catch {
+        seedNames = [];
+      }
+    }
+    return this.contextBuilder.findRelevantContext(query, { ...options, seedNames });
   }
 
   /**
