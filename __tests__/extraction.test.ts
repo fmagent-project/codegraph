@@ -743,6 +743,44 @@ export const fetchData = async () => {
       isExported: true,
     });
   });
+
+  it('should extract named functions passed through a string-named HOF', () => {
+    const code = `
+const layer = Effect.fn("SessionStatus.get")(function* (sessionID: string) {
+  return lookup(sessionID);
+});
+`;
+    const result = extractFromSource('wrapped.ts', code);
+
+    const fnNode = result.nodes.find(
+      (n) => n.kind === 'function' && n.name === 'SessionStatus.get',
+    );
+    expect(fnNode).toBeDefined();
+    expect(fnNode?.qualifiedName).toBe('SessionStatus::get');
+    expect(result.unresolvedReferences).toContainEqual(
+      expect.objectContaining({
+        fromNodeId: fnNode?.id,
+        referenceKind: 'calls',
+        referenceName: 'lookup',
+      }),
+    );
+  });
+
+  it('should keep unnamed HOF callbacks anonymous', () => {
+    const code = `const values = items.map((item) => normalize(item));`;
+    const result = extractFromSource('anonymous.ts', code);
+    expect(result.nodes.some((n) => n.kind === 'function')).toBe(false);
+  });
+
+  it('should name arrow callbacks passed through fnUntraced', () => {
+    const code = `const run = Effect.fnUntraced('Session.run')((value: string) => helper(value));`;
+    const result = extractFromSource('wrapped-arrow.ts', code);
+    const fnNode = result.nodes.find((n) => n.kind === 'function' && n.name === 'Session.run');
+    expect(fnNode?.qualifiedName).toBe('Session::run');
+    expect(result.unresolvedReferences).toContainEqual(
+      expect.objectContaining({ fromNodeId: fnNode?.id, referenceName: 'helper' }),
+    );
+  });
 });
 
 describe('Type Alias Extraction', () => {
