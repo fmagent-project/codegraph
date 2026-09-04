@@ -105,6 +105,18 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
     assertParity('fixtures/torture.js', fs.readFileSync(file, 'utf8'), 'javascript');
   });
 
+  it('string-named HOF callback parity', () => {
+      const source = `
+function lookup(sessionID: string) {
+  return sessionID;
+}
+const layer = Effect.fn("SessionStatus.get")(function* (sessionID: string) {
+  return lookup(sessionID);
+});
+`;
+    assertParity('fixtures/string-named-hof.ts', source, 'typescript');
+  });
+
   it('torture fixture (java): Lombok, anonymous classes, method refs, chains', () => {
     const file = path.join(FIXTURE_DIR, 'Torture.java');
     assertParity('fixtures/Torture.java', fs.readFileSync(file, 'utf8'), 'java');

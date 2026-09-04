@@ -20,7 +20,11 @@ export function classifyTsClassMember(node: SyntaxNode): 'method' | 'property' {
   for (let i = 0; i < node.namedChildCount; i++) {
     const child = node.namedChild(i);
     if (!child) continue;
-    if (child.type === 'arrow_function' || child.type === 'function_expression') {
+    if (
+      child.type === 'arrow_function' ||
+      child.type === 'function_expression' ||
+      child.type === 'generator_function'
+    ) {
       return 'method';
     }
     if (child.type === 'call_expression') {
@@ -28,7 +32,12 @@ export function classifyTsClassMember(node: SyntaxNode): 'method' | 'property' {
       if (args) {
         for (let j = 0; j < args.namedChildCount; j++) {
           const arg = args.namedChild(j);
-          if (arg && (arg.type === 'arrow_function' || arg.type === 'function_expression')) {
+          if (
+            arg &&
+            (arg.type === 'arrow_function' ||
+              arg.type === 'function_expression' ||
+              arg.type === 'generator_function')
+          ) {
             return 'method';
           }
         }
@@ -39,7 +48,7 @@ export function classifyTsClassMember(node: SyntaxNode): 'method' | 'property' {
 }
 
 export const typescriptExtractor: LanguageExtractor = {
-  functionTypes: ['function_declaration', 'arrow_function', 'function_expression'],
+  functionTypes: ['function_declaration', 'generator_function', 'arrow_function', 'function_expression'],
   classTypes: ['class_declaration', 'abstract_class_declaration'],
   methodTypes: ['method_definition', 'public_field_definition'],
   classifyMethodNode: classifyTsClassMember,
@@ -63,7 +72,11 @@ export const typescriptExtractor: LanguageExtractor = {
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
         if (!child) continue;
-        if (child.type === 'arrow_function' || child.type === 'function_expression') {
+        if (
+          child.type === 'arrow_function' ||
+          child.type === 'function_expression' ||
+          child.type === 'generator_function'
+        ) {
           return getChildByField(child, bodyField);
         }
         // Check inside call_expression arguments (HOF wrappers like throttle, debounce)
@@ -72,7 +85,12 @@ export const typescriptExtractor: LanguageExtractor = {
           if (args) {
             for (let j = 0; j < args.namedChildCount; j++) {
               const arg = args.namedChild(j);
-              if (arg && (arg.type === 'arrow_function' || arg.type === 'function_expression')) {
+              if (
+                arg &&
+                (arg.type === 'arrow_function' ||
+                  arg.type === 'function_expression' ||
+                  arg.type === 'generator_function')
+              ) {
                 return getChildByField(arg, bodyField);
               }
             }

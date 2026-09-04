@@ -14,16 +14,59 @@ use tree_sitter::Node;
 impl<'t> Walker<'t> {
     // --- extractFunction --------------------------------------------------------
 
+    pub(super) fn wrapped_function_name(&self, node: Node<'t>) -> Option<String> {
+        let arguments = node.parent()?;
+        let call = arguments.parent()?;
+        if arguments.kind() != "arguments" || call.kind() != "call_expression" {
+            return None;
+        }
+        let wrapper_call = call.child_by_field_name("function")?;
+        if wrapper_call.kind() != "call_expression" {
+            return None;
+        }
+        let wrapper = wrapper_call.child_by_field_name("function")?;
+        let wrapper_name = self.text(wrapper).trim();
+        if !(wrapper_name.ends_with(".fn")
+            || wrapper_name.ends_with(".fnUntraced")
+            || wrapper_name == "fn"
+            || wrapper_name == "fnUntraced")
+        {
+            return None;
+        }
+        let wrapper_args = wrapper_call.child_by_field_name("arguments")?;
+        let name_node = wrapper_args.named_child(0)?;
+        if name_node.kind() != "string" {
+            return None;
+        }
+        let raw = self.text(name_node).trim();
+        if raw.len() < 2 {
+            return None;
+        }
+        let name = &raw[1..raw.len() - 1];
+        (!name.is_empty()).then(|| name.replace("\\\"", "\"").replace("\\'", "'").replace("\\\\", "\\"))
+    }
+
     pub(super) fn extract_function(&mut self, node: Node<'t>, name_override: Option<String>) {
         let mut name = name_override
             .clone()
             .unwrap_or_else(|| self.extract_name(node));
+        let wrapped_name = if name_override.is_none() && name == "<anonymous>" {
+            self.wrapped_function_name(node)
+        } else {
+            None
+        };
+        if let Some(wrapped) = &wrapped_name {
+            name = wrapped.clone();
+        }
 
         // Arrow/function-expression values: resolve the name from the parent
         // variable_declarator (`export const useAuth = () => {}`).
         if name_override.is_none()
             && name == "<anonymous>"
-            && matches!(node.kind(), "arrow_function" | "function_expression")
+            && matches!(
+                node.kind(),
+                "arrow_function" | "function_expression" | "generator_function"
+            )
         {
             if let Some(parent) = node.parent() {
                 if parent.kind() == "variable_declarator" {
@@ -42,7 +85,7 @@ impl<'t> Walker<'t> {
             return;
         }
 
-        let extra = Extra {
+        let mut extra = Extra {
             docstring: crate::docstring::preceding_docstring(node, self.src),
             signature: self.signature_of(node),
             visibility: self.visibility_of(node),
@@ -51,6 +94,9 @@ impl<'t> Walker<'t> {
             is_static: self.is_static(node),
             ..Extra::default()
         };
+        if let Some(wrapped) = wrapped_name {
+            extra.qualified_name = Some(wrapped.replace('.', "::"));
+        }
         let Some(row) = self.create_node("function", &name, node, extra) else {
             return;
         };

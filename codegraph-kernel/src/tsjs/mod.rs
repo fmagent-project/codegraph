@@ -60,7 +60,10 @@ fn is_method_type(v: Variant, kind: &str) -> bool {
 }
 
 fn is_function_type(kind: &str) -> bool {
-    matches!(kind, "function_declaration" | "arrow_function" | "function_expression")
+    matches!(
+        kind,
+        "function_declaration" | "generator_function" | "arrow_function" | "function_expression"
+    )
 }
 
 fn is_class_type(v: Variant, kind: &str) -> bool {
@@ -704,10 +707,12 @@ impl<'t> Walker<'t> {
             self.extract_variable_type_annotation(node, owner);
         }
 
-        // Nested NAMED functions become their own nodes.
+        // Nested named functions become their own nodes. String-named wrappers
+        // such as `Effect.fn("Session.run")(function* () {})` provide an
+        // explicit name for an otherwise anonymous function expression.
         if is_function_type(kind) {
             let name = self.extract_name(node);
-            if name != "<anonymous>" {
+            if name != "<anonymous>" || self.wrapped_function_name(node).is_some() {
                 self.extract_function(node, None);
                 return;
             }
@@ -747,7 +752,10 @@ impl<'t> Walker<'t> {
         if let Some(name_node) = node.child_by_field_name("name") {
             return self.text(name_node).to_string();
         }
-        if matches!(node.kind(), "arrow_function" | "function_expression") {
+        if matches!(
+            node.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        ) {
             return "<anonymous>".to_string();
         }
         for i in 0..node.named_child_count() {
@@ -851,14 +859,20 @@ fn classify_ts_class_member(node: Node) -> Member {
     }
     for i in 0..node.named_child_count() {
         let Some(child) = node.named_child(i) else { continue };
-        if matches!(child.kind(), "arrow_function" | "function_expression") {
+        if matches!(
+            child.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        ) {
             return Member::Method;
         }
         if child.kind() == "call_expression" {
             if let Some(args) = child.child_by_field_name("arguments") {
                 for j in 0..args.named_child_count() {
                     if let Some(arg) = args.named_child(j) {
-                        if matches!(arg.kind(), "arrow_function" | "function_expression") {
+                        if matches!(
+                            arg.kind(),
+                            "arrow_function" | "function_expression" | "generator_function"
+                        ) {
                             return Member::Method;
                         }
                     }
@@ -877,14 +891,20 @@ fn resolve_field_body(node: Node) -> Option<Node> {
     }
     for i in 0..node.named_child_count() {
         let child = node.named_child(i)?;
-        if matches!(child.kind(), "arrow_function" | "function_expression") {
+        if matches!(
+            child.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        ) {
             return child.child_by_field_name("body");
         }
         if child.kind() == "call_expression" {
             if let Some(args) = child.child_by_field_name("arguments") {
                 for j in 0..args.named_child_count() {
                     if let Some(arg) = args.named_child(j) {
-                        if matches!(arg.kind(), "arrow_function" | "function_expression") {
+                        if matches!(
+                            arg.kind(),
+                            "arrow_function" | "function_expression" | "generator_function"
+                        ) {
                             return arg.child_by_field_name("body");
                         }
                     }

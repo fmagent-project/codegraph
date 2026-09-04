@@ -171,7 +171,11 @@ function extractNameRaw(node: SyntaxNode, source: string, extractor: LanguageExt
   // not from identifiers in their body. Without this, single-expression arrow
   // functions like `const fn = () => someIdentifier` get named "someIdentifier"
   // instead of "fn", because the fallback below finds the body identifier.
-  if (node.type === 'arrow_function' || node.type === 'function_expression') {
+  if (
+    node.type === 'arrow_function' ||
+    node.type === 'function_expression' ||
+    node.type === 'generator_function'
+  ) {
     return '<anonymous>';
   }
 
@@ -1527,6 +1531,32 @@ export class TreeSitterExtractor {
   /**
    * Extract a function
    */
+  private wrappedFunctionName(node: SyntaxNode): string | undefined {
+    if (
+      this.language !== 'typescript' &&
+      this.language !== 'tsx' &&
+      this.language !== 'javascript' &&
+      this.language !== 'jsx'
+    ) return undefined;
+
+    const argumentsNode = node.parent;
+    const call = argumentsNode?.parent;
+    if (argumentsNode?.type !== 'arguments' || call?.type !== 'call_expression') return undefined;
+
+    const wrapperCall = getChildByField(call, 'function');
+    if (!wrapperCall || wrapperCall.type !== 'call_expression') return undefined;
+    const wrapper = getChildByField(wrapperCall, 'function');
+    const wrapperName = wrapper ? getNodeText(wrapper, this.source).trim() : '';
+    if (!/(^|\.)fn(?:Untraced)?$/.test(wrapperName)) return undefined;
+
+    const wrapperArgs = getChildByField(wrapperCall, 'arguments');
+    const nameNode = wrapperArgs?.namedChild(0);
+    if (!nameNode || nameNode.type !== 'string') return undefined;
+    const raw = getNodeText(nameNode, this.source).trim();
+    if (raw.length < 2) return undefined;
+    return raw.slice(1, -1).replace(/\\([\\'\"])/g, '$1') || undefined;
+  }
+
   private extractFunction(node: SyntaxNode, nameOverride?: string): void {
     if (!this.extractor) return;
 
@@ -1542,6 +1572,9 @@ export class TreeSitterExtractor {
     // — SvelteKit actions). Inline-object arrows reached by the general walker
     // get no override, so they still fall through to the <anonymous> skip below.
     let name = nameOverride ?? extractName(node, this.source, this.extractor);
+    const wrappedName =
+      !nameOverride && name === '<anonymous>' ? this.wrappedFunctionName(node) : undefined;
+    if (wrappedName) name = wrappedName;
     // For arrow functions and function expressions assigned to variables,
     // resolve the name from the parent variable_declarator.
     // e.g. `export const useAuth = () => { ... }` — the arrow_function node
@@ -1549,7 +1582,9 @@ export class TreeSitterExtractor {
     if (
       !nameOverride &&
       name === '<anonymous>' &&
-      (node.type === 'arrow_function' || node.type === 'function_expression')
+      (node.type === 'arrow_function' ||
+        node.type === 'function_expression' ||
+        node.type === 'generator_function')
     ) {
       const parent = node.parent;
       if (parent?.type === 'variable_declarator') {
@@ -1600,6 +1635,7 @@ export class TreeSitterExtractor {
       isAsync,
       isStatic,
       returnType,
+      ...(wrappedName ? { qualifiedName: wrappedName.replace(/\./g, '::') } : {}),
     });
     if (!funcNode) return;
 
@@ -5305,13 +5341,17 @@ export class TreeSitterExtractor {
       // Nested NAMED functions inside a body — function declarations and named
       // function expressions like `.on('mount', function onmount(){})` — become
       // their own nodes so the graph can link to them (callback handlers, local
-      // helpers). Anonymous arrows/expressions fall through to the default
-      // recursion below, keeping their inner calls attributed to the enclosing
-      // function: this bounds the new nodes to NAMED functions only (no explosion,
-      // no lost edges). extractFunction walks the nested body itself, so we return.
+      // helpers). A function expression passed through a string-named wrapper
+      // (for example `Effect.fn("Session.run")(function* () {})`) is named by
+      // that wrapper; truly anonymous arrows/expressions still fall through to
+      // the default recursion below. extractFunction walks the nested body
+      // itself, so we return.
       if (this.extractor!.functionTypes.includes(nodeType)) {
         const nestedName = extractName(node, this.source, this.extractor!);
-        if (nestedName && nestedName !== '<anonymous>') {
+        if (
+          (nestedName && nestedName !== '<anonymous>') ||
+          this.wrappedFunctionName(node)
+        ) {
           this.extractFunction(node);
           return;
         }

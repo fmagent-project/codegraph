@@ -3,7 +3,7 @@ import type { LanguageExtractor } from '../tree-sitter-types';
 import { classifyTsClassMember } from './typescript';
 
 export const javascriptExtractor: LanguageExtractor = {
-  functionTypes: ['function_declaration', 'arrow_function', 'function_expression'],
+  functionTypes: ['function_declaration', 'generator_function', 'arrow_function', 'function_expression'],
   classTypes: ['class_declaration'],
   methodTypes: ['method_definition', 'field_definition'],
   // JS `field_definition` ≙ TS `public_field_definition`: plain fields are
@@ -39,7 +39,11 @@ export const javascriptExtractor: LanguageExtractor = {
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
         if (!child) continue;
-        if (child.type === 'arrow_function' || child.type === 'function_expression') {
+        if (
+          child.type === 'arrow_function' ||
+          child.type === 'function_expression' ||
+          child.type === 'generator_function'
+        ) {
           return getChildByField(child, bodyField);
         }
         if (child.type === 'call_expression') {
@@ -47,7 +51,12 @@ export const javascriptExtractor: LanguageExtractor = {
           if (args) {
             for (let j = 0; j < args.namedChildCount; j++) {
               const arg = args.namedChild(j);
-              if (arg && (arg.type === 'arrow_function' || arg.type === 'function_expression')) {
+              if (
+                arg &&
+                (arg.type === 'arrow_function' ||
+                  arg.type === 'function_expression' ||
+                  arg.type === 'generator_function')
+              ) {
                 return getChildByField(arg, bodyField);
               }
             }

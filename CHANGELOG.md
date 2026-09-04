@@ -12,6 +12,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- TypeScript and JavaScript functions wrapped in string-named higher-order
+  calls (such as `Effect.fn("Session.run")`) are now indexed with their
+  logical names and bodies, including native-kernel extraction.
 
 ## [1.6.0] - 2026-08-26
 
