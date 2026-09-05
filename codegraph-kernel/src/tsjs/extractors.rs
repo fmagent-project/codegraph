@@ -5,6 +5,7 @@
 
 use crate::textutil as util;
 use super::{
+    Variant,
     body_of, is_builtin_type, is_literal_receiver, is_react_hoc, is_variable_type,
     is_vue_collection_name, Extra, Scope, Walker,
 };
