@@ -14,6 +14,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- TypeScript and JavaScript chained method calls no longer collapse to a bare
+  method name when the receiver is another call, avoiding false self-edges
+  such as `Provider.configure().model()` resolving to a local `model` function.
+
+### Fixes
+
 - TypeScript and JavaScript functions wrapped in string-named higher-order
   calls (such as `Effect.fn("Session.run")`) are now indexed with their
   logical names and bodies, including native-kernel extraction.

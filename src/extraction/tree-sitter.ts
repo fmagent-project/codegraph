@@ -4509,6 +4509,22 @@ export class TreeSitterExtractor {
               const fieldName = getNodeText(getChildByField(receiver, 'field')!, this.source);
               calleeName = `self.${fieldName}.${methodName}`;
             } else if (
+              (this.language === 'typescript' ||
+                this.language === 'tsx' ||
+                this.language === 'javascript' ||
+                this.language === 'jsx') &&
+              receiver &&
+              receiver.type === 'call_expression'
+            ) {
+              // Preserve a factory receiver (`Provider.configure().model()`)
+              // instead of collapsing it to bare `model`, which can resolve to
+              // an unrelated local function with the same name.
+              const innerFunc = getChildByField(receiver, 'function');
+              const innerCallee = innerFunc
+                ? getNodeText(innerFunc, this.source).replace(/\s+/g, '')
+                : '';
+              calleeName = innerCallee ? `${innerCallee}().${methodName}` : methodName;
+            } else if (
               (this.language === 'cpp' ||
                 this.language === 'c' ||
                 this.language === 'kotlin' ||

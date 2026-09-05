@@ -2630,6 +2630,10 @@ export function matchReference(
   // (#645/#608 mechanism). Resolve the method's class from the inner call's
   // declared return type, then validate it.
   if (
+    ref.language === 'typescript' ||
+    ref.language === 'tsx' ||
+    ref.language === 'javascript' ||
+    ref.language === 'jsx' ||
     ref.language === 'java' ||
     ref.language === 'kotlin' ||
     ref.language === 'csharp' ||

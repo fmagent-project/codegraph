@@ -1121,9 +1121,21 @@ impl<'t> Walker<'t> {
                         } else {
                             callee_name = method_name.to_string();
                         }
+                    } else if matches!(self.variant, Variant::Typescript | Variant::Tsx | Variant::Javascript | Variant::Jsx)
+                        && receiver.map(|r| r.kind() == "call_expression").unwrap_or(false)
+                    {
+                        // Preserve a factory receiver (`Provider.configure().model()`)
+                        // instead of collapsing it to bare `model`.
+                        let inner = receiver
+                            .and_then(|r| r.child_by_field_name("function"))
+                            .map(|r| self.text(r).replace(char::is_whitespace, ""))
+                            .unwrap_or_default();
+                        callee_name = if inner.is_empty() {
+                            method_name.to_string()
+                        } else {
+                            format!("{inner}().{method_name}")
+                        };
                     } else {
-                        // (the call-receiver re-encode branches are other
-                        // languages'; TS/JS keeps the bare method name)
                         callee_name = method_name.to_string();
                     }
                 }
