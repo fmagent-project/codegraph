@@ -3,15 +3,43 @@
 FM-Agent's maintenance fork of
 [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph).
 
-**Pinned base:** upstream `v1.6.0` (2026-08-26) — a tagged release, as the policy
-below prefers. It carries fixes for the three issues reported upstream from this
-project since the previous base: Rust field-receiver resolution
+**Pinned base:** upstream `b9ca4b7` (`main`, 2026-08-31) — an untagged commit, the
+exception the policy below allows. Upstream has not tagged since `v1.6.0`, and this
+sync is not driven by a fix we need: it moves the fork onto upstream's unreleased
+work so those features are available to us later, and so the next sync is a short
+hop rather than another long one.
+
+Nothing upstream has vetted this point, so the verification is ours. Those 60
+commits are almost entirely the new `codegraph ui` browser viewer and the
+Steps/Screens route visualisations; no engine change reaches the languages
+FM-Agent indexes. That was measured, not assumed — every `calls` edge compared
+by call-site position (file, line, column), since a rename would make a
+name-keyed comparison lie:
+
+| Corpus | Language | Call sites | Resolved differently |
+|--------|----------|-----------:|---------------------:|
+| redis | C | 48,806 | 0 |
+| leveldb | C++ | 5,661 | 0 |
+| FM-Agent | Python | 1,059 | 0 |
+| this repo | Rust | 3,574 | 0 |
+| this repo | TypeScript | 23,784 | 0 |
+| this repo | JavaScript | 1,158 | 0 |
+| this repo | Svelte | 518 | **13** |
+
+The thirteen are the whole of the drift, and they are a fix: `toast.show()` used
+to resolve to the receiver `toast` and now resolves to the method `show`
+(upstream's object-literal namespace-member resolution). They sit in upstream's
+own `.svelte` sources, a file type FM-Agent does not index. The Svelte row is
+also what makes the zero rows worth trusting — it shows the comparison detects
+change when there is change to detect.
+
+The previous base was `v1.6.0` (2026-08-26), 60 commits behind this point; it
+carried fixes for three issues reported upstream from this project — Rust
+field-receiver resolution
 ([#1585](https://github.com/colbymchenry/codegraph/issues/1585)), generic `impl`
 ownership ([#1588](https://github.com/colbymchenry/codegraph/issues/1588)) and
 Erlang per-arity identity
-([#1610](https://github.com/colbymchenry/codegraph/issues/1610)). The previous
-base was `c6aaa20` (upstream `main`, 2026-08-07), 27 commits behind this tag; see
-issue #10 for the full rationale of this sync.
+([#1610](https://github.com/colbymchenry/codegraph/issues/1610)).
 
 Upstream shipped the C macro-attribute extraction fix (issue #1211, PR #1311) in
 v1.5.0, so the base carries it natively; the fork no longer needs its own patch
@@ -33,10 +61,25 @@ tree or changing how the runner discovers it: our file would stay where it is, q
 stop being collected, and nothing would fail. Check the suite's file count after a
 sync, not just that it is green.
 
+This base is the first time that actually happened: upstream renamed
+`vitest.config.ts` to `vitest.config.mts` and split the suite into two projects with
+a new `vitest.workspace.mts` (an `engine` project and a `ui` one, so the Svelte
+component test can have jsdom and browser resolution conditions without handing them
+to the engine suites). The `engine` project includes `__tests__/**/*.test.ts`, so our
+file is still collected — confirmed by running it, not by reading the config. Run
+`npx vitest run --project engine __tests__/fm-agent-workdir-exclusion.test.ts` after
+a sync and check it reports 4 passing tests.
+
 **Version marker:** `codegraph --version` → `1.6.0-fmagent.N` identifies a build
-from this fork. Note this is a SemVer pre-release of `1.6.0`, so it sorts *below*
-plain `1.6.0`; the updater must therefore point at this fork (see below), never
-upstream, or it would advertise a "downgrade to upstream" as an upgrade.
+from this fork. It lives in **two** files as of this base: the root `package.json`
+and `ui/package.json`. Upstream's `ui-package.test.ts` asserts the two match, so
+bumping only the root fails `npm test` — which is how a future sync will catch it.
+(Upstream's own `package.json` still reads `1.6.0` at this base: the unreleased
+work is not version-bumped yet, so the marker stays a `1.6.0` pre-release.)
+
+Note this is a SemVer pre-release of `1.6.0`, so it sorts *below* plain `1.6.0`;
+the updater must therefore point at this fork (see below), never upstream, or it
+would advertise a "downgrade to upstream" as an upgrade.
 
 **All install/upgrade entry points point at this fork,** so a fork install never
 silently escapes back to upstream: `install.sh` / `install.ps1` (`REPO` / `$repo`)
