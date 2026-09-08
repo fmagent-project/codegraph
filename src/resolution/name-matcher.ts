@@ -389,6 +389,78 @@ function isLexicallyReachable(
 }
 
 /**
+ * Wrapper-named function bindings (Effect-TS `Effect.fn("Ns.name")(fn)`, and
+ * any higher-order wrapper whose debug string the extractor adopts as the
+ * node name): `const readToolCall = Effect.fn("SessionProcessor.readToolCall")(fn)`
+ * extracts a FUNCTION named `SessionProcessor.readToolCall`, while call sites
+ * reference the binding's bare name `readToolCall`. Function-local consts are
+ * not indexed as nodes, so nothing is named `readToolCall` — exact-name
+ * matching fails outright, or worse, binds a same-named function in an
+ * unrelated file. Bridge the two names: a bare call resolves to the
+ * same-file function/method whose name ends `.<ref>` (qualified name ends
+ * `::<ref>`), when exactly one such node is visible from the call site —
+ * directly inside the ref's innermost enclosing function, or at module
+ * scope. Ambiguity and cross-scope candidates decline: no edge beats a wrong
+ * one.
+ */
+export function matchWrappedLocalName(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (ref.referenceKind !== 'calls') return null;
+  if (!TS_JS_LANGUAGES.has(ref.language)) return null;
+  if (!/^[A-Za-z_$][\w$]*$/.test(ref.referenceName)) return null;
+
+  const nodesInFile = context.getNodesInFile(ref.filePath);
+  const fromNode =
+    context.getNodeById?.(ref.fromNodeId) ??
+    nodesInFile.find((n) => n.id === ref.fromNodeId) ??
+    null;
+  if (!fromNode) return null;
+
+  const isFn = (n: Node): boolean => n.kind === 'function' || n.kind === 'method';
+  const contains = (outer: Node, inner: Node): boolean =>
+    outer.id !== inner.id &&
+    outer.startLine <= inner.startLine &&
+    outer.endLine >= inner.endLine;
+
+  // Innermost function/method containing the ref's source node — the scope
+  // that binds the wrapper-named const.
+  const scopeFns = nodesInFile.filter((n) => isFn(n) && contains(n, fromNode));
+  const innermostScope =
+    scopeFns.length > 0
+      ? scopeFns.reduce((a, b) => (a.startLine >= b.startLine ? a : b))
+      : null;
+
+  const isModuleScope = (n: Node): boolean =>
+    !nodesInFile.some((o) => isFn(o) && contains(o, n));
+  const directInScope = (n: Node, scope: Node): boolean =>
+    contains(scope, n) &&
+    !nodesInFile.some(
+      (o) => isFn(o) && o.id !== scope.id && contains(scope, o) && contains(o, n),
+    );
+
+  const dotted = `.${ref.referenceName}`;
+  const scoped = `::${ref.referenceName}`;
+  const candidates = nodesInFile.filter((n) => {
+    if (!isFn(n)) return false;
+    if (!n.name.endsWith(dotted) && !n.qualifiedName.endsWith(scoped)) return false;
+    if (innermostScope) {
+      return directInScope(n, innermostScope) || isModuleScope(n);
+    }
+    return isModuleScope(n);
+  });
+
+  if (candidates.length !== 1) return null;
+  return {
+    original: ref,
+    targetNodeId: candidates[0]!.id,
+    confidence: 0.9,
+    resolvedBy: 'exact-match',
+  };
+}
+
+/**
  * Try to resolve a reference by exact name match
  */
 export function matchByExactName(
@@ -577,6 +649,15 @@ export function preferCallSiteFile(nodes: Node[], callSiteFile: string): Node[] 
  * api = { call() {…}, get: () => {…} }` used as a namespace (#1573).
  */
 const OBJECT_LITERAL_LANGUAGES = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx', 'arkts']);
+
+/**
+ * Languages where higher-order function wrappers can rename a binding's
+ * function node (Effect-TS `Effect.fn("Ns.name")(fn)`): the extractor adopts
+ * the wrapper's debug string as the node name while call sites use the
+ * binding identifier. ArkTS excluded — the Effect naming convention is a
+ * TypeScript-ecosystem pattern.
+ */
+const TS_JS_LANGUAGES = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx']);
 
 /** True when `inner`'s source range lies within `outer`'s (lines, then columns on a shared line). */
 function rangeWithin(inner: Node, outer: Node): boolean {
@@ -1723,6 +1804,43 @@ function inferPhpAssignedPropertyType(
 }
 
 /**
+ * The service namespace N in the receiver's own declaration
+ * `const recv = yield* N.Service` (Effect-TS), or null when the receiver's
+ * nearest declaration binds anything else. Only declarations BEFORE the call
+ * count, and the LAST one wins: a shadowing re-bind (`const session =
+ * yield* sessions.get(...)` — a row, not the service) must decline, never
+ * inherit an outer service type. One extra hop covers service instances
+ * handed out by a sibling service's factory: `const processor =
+ * yield* processors.create(...)` resolves through `processors`' own
+ * `yield* Ns.Service` declaration.
+ */
+function inferEffectServiceNamespace(
+  receiver: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  depth: number = 0,
+): string | null {
+  const lines =
+    context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split('\n') ?? null;
+  if (!lines) return null;
+  const escaped = receiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const declRe = new RegExp(`\\bconst\\s+${escaped}\\s*=\\s*(.+)$`);
+  let init: string | null = null;
+  for (let i = 0; i < Math.min(ref.line, lines.length); i++) {
+    const m = lines[i]!.replace(/\/\/.*$/, '').match(declRe);
+    if (m) init = m[1]!;
+  }
+  if (!init) return null;
+  const svc = init.match(/\byield\*\s*([A-Z][\w$]*)\.Service\b/);
+  if (svc) return svc[1]!;
+  if (depth === 0) {
+    const via = init.match(/\byield\*\s*([a-z][\w$]*)\.create\(/);
+    if (via) return inferEffectServiceNamespace(via[1]!, ref, context, 1);
+  }
+  return null;
+}
+
+/**
  * Try to resolve by method name on a class/object
  */
 export function matchMethodCall(
@@ -1830,6 +1948,39 @@ export function matchMethodCall(
         return typedMatch;
       }
     }
+  }
+
+  // Effect-TS service locals: `const state = yield* SessionRunState.Service`
+  // gives `state` no source-level type, so the inference path above finds
+  // nothing. The binding text is explicit, though, and the extractor names
+  // service members after the wrapper string — `Effect.fn("SessionRunState.assertNotBusy")`
+  // yields a function node named `SessionRunState.assertNotBusy`. Recover the
+  // service namespace from the receiver's OWN nearest declaration (a shadow
+  // or a non-service initializer declines), require the ref's file to import
+  // that namespace, and resolve only a unique `Ns.method` member node.
+  if (
+    dotMatch &&
+    !objectOrClass!.includes('.') &&
+    TS_JS_LANGUAGES.has(ref.language) &&
+    methodName
+  ) {
+    const serviceMatch = nmTimedT('mc-effect-svc', ref, (): ResolvedRef | null => {
+      const ns = inferEffectServiceNamespace(objectOrClass!, ref, context);
+      if (!ns) return null;
+      const imports = context.getImportMappings(ref.filePath, ref.language);
+      if (!imports.some((m) => m.localName === ns)) return null;
+      const members = context
+        .getNodesByName(`${ns}.${methodName}`)
+        .filter((n) => n.kind === 'function' || n.kind === 'method');
+      if (members.length !== 1) return null;
+      return {
+        original: ref,
+        targetNodeId: members[0]!.id,
+        confidence: 0.85,
+        resolvedBy: 'instance-method',
+      };
+    });
+    if (serviceMatch) return serviceMatch;
   }
 
   // Go 2-hop field chain `base.field.Method` (#1276): the base's type comes
@@ -2650,6 +2801,14 @@ export function matchReference(
 
   // 2. Method call pattern
   result = nmTimed('methodCall', ref, () => matchMethodCall(ref, context));
+  if (result) return result;
+
+  // 2.5. Wrapper-named local function (TS/JS): the extractor named the node
+  // after a wrapper string (`Effect.fn("Ns.name")`) while the call site uses
+  // the binding's bare name. Runs BEFORE the global exact-name match so a
+  // same-named function in an unrelated file (e.g. a test helper) can never
+  // steal a call that has a unique same-file wrapper target.
+  result = nmTimed('wrappedLocal', ref, () => matchWrappedLocalName(ref, context));
   if (result) return result;
 
   // 3. Exact name match

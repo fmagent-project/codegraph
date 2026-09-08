@@ -269,6 +269,12 @@ export class ReferenceResolver {
   // it between passes. Callers must treat the returned array as read-only.
   private nodesByKindCache = new Map<Node['kind'], Node[]>();
   private knownNames: Set<string> | null = null; // all known symbol names for fast pre-filtering
+  // Last segments of dotted/scoped node names (`Ns.helper` → `helper`),
+  // derived lazily from knownNames. Wrapper-named members (Effect-TS
+  // `Effect.fn("Ns.helper")`) are indexed under the wrapper string while
+  // call sites name only the tail, so the exact-name pre-filter needs this
+  // existence index to let those refs through.
+  private knownMemberTails: Set<string> | null = null;
   private knownFiles: Set<string> | null = null;
   private cachesWarmed = false;
   // tsconfig/jsconfig path-alias map. `undefined` = not yet computed,
@@ -400,6 +406,7 @@ export class ReferenceResolver {
     this.supertypeGen++;
     this.nodesByKindCache.clear();
     this.knownNames = null;
+    this.knownMemberTails = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
     // The import-resolver's and name-matcher's per-context memos assume the
@@ -831,6 +838,55 @@ export class ReferenceResolver {
   }
 
   /**
+   * Last segments of dotted/scoped node names (`Ns.helper` → `helper`,
+   * `Ns::helper` → `helper`), derived once from knownNames. Existence index
+   * for matchesWrapperNamedMember.
+   */
+  private memberTails(): Set<string> | null {
+    if (!this.knownNames) return null;
+    if (!this.knownMemberTails) {
+      const tails = new Set<string>();
+      for (const name of this.knownNames) {
+        const dot = name.lastIndexOf('.');
+        if (dot > 0 && dot < name.length - 1) tails.add(name.slice(dot + 1));
+        const col = name.lastIndexOf('::');
+        if (col > 0 && col < name.length - 2) tails.add(name.slice(col + 2));
+      }
+      this.knownMemberTails = tails;
+    }
+    return this.knownMemberTails;
+  }
+
+  /**
+   * Wrapper-named members (Effect-TS `Effect.fn("Ns.name")(fn)`) index the
+   * node under the wrapper string while call sites name only the tail — the
+   * bare binding (`helper(...)`) or a service local's member
+   * (`state.assertNotBusy()`). Neither `helper` nor `state.assertNotBusy`
+   * exists as a symbol, so the fast pre-filter would kill refs the
+   * name-matcher's wrapper/service strategies resolve. Escape when any node
+   * name carries the ref's tail segment; the strategies themselves stay
+   * uniqueness/scope/import-gated, so a pass here buys a lookup, not an
+   * edge.
+   */
+  private matchesWrapperNamedMember(ref: UnresolvedRef): boolean {
+    if (
+      ref.language !== 'typescript' &&
+      ref.language !== 'tsx' &&
+      ref.language !== 'javascript' &&
+      ref.language !== 'jsx'
+    ) {
+      return false;
+    }
+    if (ref.referenceKind !== 'calls') return false;
+    const name = ref.referenceName;
+    if (!/^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)?$/.test(name)) return false;
+    const tails = this.memberTails();
+    if (!tails) return false;
+    const dot = name.lastIndexOf('.');
+    return tails.has(dot >= 0 ? name.slice(dot + 1) : name);
+  }
+
+  /**
    * Does `ref.referenceName` match an import declared in its containing
    * file? Used as a pre-filter escape so re-export chain resolution
    * still gets a chance when the name has no project-wide declaration.
@@ -898,7 +954,8 @@ export class ReferenceResolver {
       isNixPathImportRef(ref) ||
       this.hasAnyPossibleMatch(existenceName) ||
       this.matchesAnyImport(ref) ||
-      this.frameworks.some((f) => f.claimsReference?.(ref.referenceName));
+      this.frameworks.some((f) => f.claimsReference?.(ref.referenceName)) ||
+      this.matchesWrapperNamedMember(ref);
     if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
     if (!preFilterPass) {
       return null;
