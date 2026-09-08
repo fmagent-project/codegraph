@@ -14,6 +14,19 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- TypeScript and JavaScript higher-order wrappers that name a function through
+  a debug string — Effect-TS `Effect.fn("Ns.name")(fn)` — no longer sever the
+  call graph. Bare calls to the wrapper's local binding (`readToolCall(...)`)
+  now resolve to the wrapper-named node when exactly one is visible from the
+  call site's scope, instead of failing outright or binding a same-named
+  function in an unrelated file; and member calls on service locals bound
+  with `const x = yield* Ns.Service` (including one `Ns.create(...)` factory
+  hop) resolve to the service's `Ns.member` nodes. Both paths decline on
+  ambiguity, cross-scope candidates, a missing import, or a shadowing
+  re-bind. On an Effect-heavy codebase this replaces hundreds of wrong
+  cross-file bare-name edges (calls landing on test helpers and unrelated
+  classes) with the correct targets.
+
 - TypeScript and JavaScript chained method calls no longer collapse to a bare
   method name when the receiver is another call, avoiding false self-edges
   such as `Provider.configure().model()` resolving to a local `model` function.
