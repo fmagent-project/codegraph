@@ -117,7 +117,11 @@ function dartCalleeOfArgPart(argPart: SyntaxNode): string | undefined {
 
 export const dartExtractor: LanguageExtractor = {
   functionTypes: ['function_signature'],
-  classTypes: ['class_definition'],
+  // `extension_type_declaration` is Dart 3.3's extension type. Its members sit
+  // in an ordinary `class_body`, so listing it here is all it takes for them to
+  // be walked; without it the body is never entered, its getters get no node,
+  // and the members that follow end up with their spans cut short.
+  classTypes: ['class_definition', 'extension_type_declaration'],
   // `method_signature` covers regular methods AND factory constructors (which
   // parse as method_signature > factory_constructor_signature). A plain named
   // constructor `Foo._()` parses as a bare `constructor_signature`, so include
