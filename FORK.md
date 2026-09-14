@@ -22,8 +22,8 @@ Upstream's generator fix stops short in one place — the two helpers that read 
 class field's value still do not list `generator_function` — so the part of the
 fork's patch covering that shape stays, as patch 4 below.
 
-The previous base was `v1.6.0` (2026-08-26), 60 commits behind this point; it
-carried fixes for Rust field-receiver resolution
+The previous base was `v1.6.0` (2026-08-26), 120 commits behind this point (115
+of them not merges); it carried fixes for Rust field-receiver resolution
 ([#1585](https://github.com/colbymchenry/codegraph/issues/1585)), generic `impl`
 ownership ([#1588](https://github.com/colbymchenry/codegraph/issues/1588)) and
 Erlang per-arity identity
