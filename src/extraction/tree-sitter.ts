@@ -1603,6 +1603,12 @@ export class TreeSitterExtractor {
     // — SvelteKit actions). Inline-object arrows reached by the general walker
     // get no override, so they still fall through to the <anonymous> skip below.
     let name = nameOverride ?? extractName(node, this.source, this.extractor);
+    // A wrapper's string argument names the function it wraps; see
+    // wrappedFunctionName. Applied before the declarator fallbacks below, since
+    // it is the more specific name — `Session.run` over a bare `run`.
+    const wrappedName =
+      !nameOverride && name === '<anonymous>' ? this.wrappedFunctionName(node) : undefined;
+    if (wrappedName) name = wrappedName;
     // A CommonJS export assignment names the function it holds — see below.
     let commonJsExport = false;
     // For arrow functions and function expressions assigned to variables,
@@ -1675,6 +1681,10 @@ export class TreeSitterExtractor {
       isAsync,
       isStatic,
       returnType,
+      // The wrapper string already carries the qualification the author wrote
+      // (`Session.run` is `run` OF `Session`), so it becomes the qualified name
+      // rather than being nested under whatever container the walk is inside.
+      ...(wrappedName ? { qualifiedName: wrappedName.replace(/\./g, '::') } : {}),
     });
     if (!funcNode) return;
 
@@ -5567,6 +5577,45 @@ export class TreeSitterExtractor {
    * JS-family only; the node must be the hook call's FIRST argument, and the
    * call's value must be bound directly by a `variable_declarator`.
    */
+  /**
+   * The name a string-named higher-order wrapper gives the anonymous function
+   * it wraps — `Effect.fn("Session.run")(function* () {…})` → `Session.run` —
+   * or undefined for any other shape.
+   *
+   * The function is anonymous only syntactically: its name is right there, as
+   * the wrapper's first argument, and it is the name that appears in a trace or
+   * a log. Without it the function gets no node at all, so its body's calls
+   * attribute to whatever encloses it and its own callers have nothing to point
+   * at. The shape is reached wherever an anonymous function is walked, which is
+   * what lets it cover a service object returned from inside a function — the
+   * common form in an Effect codebase — and not only a `const` binding.
+   */
+  private wrappedFunctionName(node: SyntaxNode): string | undefined {
+    if (
+      this.language !== 'typescript' &&
+      this.language !== 'tsx' &&
+      this.language !== 'javascript' &&
+      this.language !== 'jsx'
+    ) return undefined;
+
+    const argumentsNode = node.parent;
+    const call = argumentsNode?.parent;
+    if (argumentsNode?.type !== 'arguments' || call?.type !== 'call_expression') return undefined;
+
+    const wrapperCall = getChildByField(call, 'function');
+    if (!wrapperCall || wrapperCall.type !== 'call_expression') return undefined;
+    const wrapper = getChildByField(wrapperCall, 'function');
+    const wrapperName = wrapper ? getNodeText(wrapper, this.source).trim() : '';
+    if (!/(^|\.)fn(?:Untraced)?$/.test(wrapperName)) return undefined;
+
+    const wrapperArgs = getChildByField(wrapperCall, 'arguments');
+    const nameNode = wrapperArgs?.namedChild(0);
+    if (!nameNode || nameNode.type !== 'string') return undefined;
+    const raw = getNodeText(nameNode, this.source).trim();
+    if (raw.length < 2) return undefined;
+    return raw.slice(1, -1).replace(/\\([\\'"])/g, '$1') || undefined;
+  }
+
   private reactHookBoundName(node: SyntaxNode): string | null {
     if (
       this.language !== 'typescript' &&
@@ -5589,100 +5638,6 @@ export class TreeSitterExtractor {
     if (!declarator || declarator.type !== 'variable_declarator') return null;
     const nameNode = getChildByField(declarator, 'name');
     return nameNode?.type === 'identifier' ? getNodeText(nameNode, this.source) : null;
-  }
-
-  /**
-   * The declarator name for an anonymous function passed to a CURRIED wrapper
-   * call — `const NAME = factory(...)(function () {…})` — or null.
-   *
-   * `reactHookBoundName` above already names a function through the declarator
-   * that binds it; the shape is general, but that method is deliberately
-   * bounded to the three React handler hooks. This is the same shape with a
-   * different, equally decidable bound: the callee is itself a call, i.e. a
-   * factory that returns the wrapper (#1747).
-   *
-   * Requiring the callee to be a call is what keeps this narrow. It admits
-   * `Effect.fn("Session.run")(function* () {…})`, `connect(mapState)(fn)` and
-   * a project's own `wrap("name")(fn)`, and it does not admit the one-call
-   * forms where the argument is a computation rather than a body worth a node
-   * of its own — `useMemo(() => 1 + 1, [])`, `arr.map(() => …)` — which stay
-   * anonymous exactly as before.
-   *
-   * Generators are included here and not in `reactHookBoundName`: a React
-   * handler is never a generator, while `function*` is the common form in the
-   * ecosystem this shape comes from.
-   */
-  private curriedWrapperBoundName(node: SyntaxNode): string | null {
-    if (
-      this.language !== 'typescript' &&
-      this.language !== 'javascript' &&
-      this.language !== 'tsx' &&
-      this.language !== 'jsx'
-    ) {
-      return null;
-    }
-    if (
-      node.type !== 'arrow_function' &&
-      node.type !== 'function_expression' &&
-      node.type !== 'generator_function'
-    ) {
-      return null;
-    }
-    const args = node.parent;
-    if (!args || args.type !== 'arguments') return null;
-    const first = args.namedChild(0);
-    if (!first || first.startIndex !== node.startIndex || first.endIndex !== node.endIndex) return null;
-    const call = args.parent;
-    if (!call || call.type !== 'call_expression') return null;
-    // The bound that replaces the hook allowlist: the thing being called is
-    // itself a call, so this is the second application of a curried wrapper.
-    const callee = getChildByField(call, 'function');
-    if (!callee || callee.type !== 'call_expression') return null;
-    const declarator = call.parent;
-    if (!declarator || declarator.type !== 'variable_declarator') return null;
-    const nameNode = getChildByField(declarator, 'name');
-    if (nameNode?.type !== 'identifier') return null;
-    // A name the factory was handed in the source beats the declarator, because
-    // it is the one the author qualified: `Effect.fn("Session.run")` says the
-    // function is `run` of `Session`, while the declarator only says `run`. The
-    // qualified form is what a reader recognises in a stack trace or a log, and
-    // it keeps two same-named handlers in different namespaces apart. Falls back
-    // to the declarator whenever the factory carries no literal name, which is
-    // every other curried wrapper (`connect(mapState)`, a project's own HOC).
-    return (
-      this.curriedWrapperLiteralName(callee) ?? getNodeText(nameNode, this.source)
-    );
-  }
-
-  /**
-   * The literal name a curried factory was handed as its first argument —
-   * `Effect.fn("Session.run")` → `Session.run` — or null when it has none.
-   *
-   * Both a plain string and a template literal with no substitutions count: the
-   * two are interchangeable in source and carry the same name. A template that
-   * interpolates is not a name, and neither is a variable or a computed value,
-   * so those decline and the declarator is used instead.
-   */
-  private curriedWrapperLiteralName(factoryCall: SyntaxNode): string | null {
-    const args = getChildByField(factoryCall, 'arguments');
-    const first = args?.namedChild(0);
-    if (!first) return null;
-    if (first.type === 'string') {
-      const raw = getNodeText(first, this.source).trim();
-      if (raw.length < 2) return null;
-      return raw.slice(1, -1).replace(/\\(['"\\])/g, '$1') || null;
-    }
-    if (first.type === 'template_string') {
-      // A substitution makes the text a computation rather than a name. The
-      // fragment children are the literal text and are expected.
-      for (let i = 0; i < first.namedChildCount; i++) {
-        if (first.namedChild(i)?.type === 'template_substitution') return null;
-      }
-      const raw = getNodeText(first, this.source).trim();
-      if (raw.length < 2) return null;
-      return raw.slice(1, -1) || null;
-    }
-    return null;
   }
 
   private visitFunctionBody(body: SyntaxNode, _functionId: string): void {
@@ -5803,7 +5758,10 @@ export class TreeSitterExtractor {
       // no lost edges). extractFunction walks the nested body itself, so we return.
       if (this.extractor!.functionTypes.includes(nodeType)) {
         const nestedName = extractName(node, this.source, this.extractor!);
-        if (nestedName && nestedName !== '<anonymous>') {
+        if (
+          (nestedName && nestedName !== '<anonymous>') ||
+          this.wrappedFunctionName(node)
+        ) {
           this.extractFunction(node);
           return;
         }
@@ -5820,16 +5778,6 @@ export class TreeSitterExtractor {
         const hookBound = this.reactHookBoundName(node);
         if (hookBound) {
           this.extractFunction(node, hookBound);
-          return;
-        }
-        // `const run = Effect.fn("Session.run")(function* () {…})` (#1747) —
-        // the same declarator binding through a curried wrapper. Without a node
-        // the body's calls attribute to the enclosing container, so the file or
-        // the outer function picks up an outgoing edge that belongs to this
-        // function and the callee's caller list names the wrong thing.
-        const wrapperBound = this.curriedWrapperBoundName(node);
-        if (wrapperBound) {
-          this.extractFunction(node, wrapperBound);
           return;
         }
         // `const handleClear = () => {…}` inside a body (#1669) — the same

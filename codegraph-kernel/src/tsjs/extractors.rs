@@ -18,6 +18,17 @@ impl<'t> Walker<'t> {
         let mut name = name_override
             .clone()
             .unwrap_or_else(|| self.extract_name(node));
+        // A wrapper's string argument names the function it wraps; see
+        // wrapped_function_name. Applied before the declarator fallbacks below,
+        // being the more specific name — `Session.run` over a bare `run`.
+        let wrapped_name = if name_override.is_none() && name == "<anonymous>" {
+            self.wrapped_function_name(node)
+        } else {
+            None
+        };
+        if let Some(wrapped) = &wrapped_name {
+            name = wrapped.clone();
+        }
 
         // Arrow/function-expression values: resolve the name from the parent
         // variable_declarator (`export const useAuth = () => {}`), or from a
@@ -50,7 +61,7 @@ impl<'t> Walker<'t> {
             return;
         }
 
-        let extra = Extra {
+        let mut extra = Extra {
             docstring: crate::docstring::preceding_docstring(node, self.src),
             signature: self.signature_of(node),
             visibility: self.visibility_of(node),
@@ -59,6 +70,12 @@ impl<'t> Walker<'t> {
             is_static: self.is_static(node),
             ..Extra::default()
         };
+        // The wrapper string already carries the qualification the author
+        // wrote, so it becomes the qualified name rather than being nested
+        // under whatever container the walk is inside.
+        if let Some(wrapped) = wrapped_name {
+            extra.qualified_name = Some(wrapped.replace('.', "::"));
+        }
         let Some(row) = self.create_node("function", &name, node, extra) else {
             return;
         };
