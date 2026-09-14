@@ -81,6 +81,27 @@ fn is_signature_method_type(kind: &str) -> bool {
     kind == "method_signature"
 }
 
+/// `\"` / `\'` / `\\` inside a string literal stand for the bare character.
+fn unescape_quotes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(n @ ('"' | '\'' | '\\')) => out.push(n),
+                Some(n) => {
+                    out.push('\\');
+                    out.push(n);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn is_function_type(kind: &str) -> bool {
     matches!(kind, "function_declaration" | "generator_function_declaration" | "arrow_function" | "function_expression" | "generator_function")
 }
@@ -752,6 +773,13 @@ impl<'t> Walker<'t> {
                 self.extract_function(node, Some(bound));
                 return;
             }
+            // `const run = Effect.fn("Session.run")(function* () {…})` (#1747):
+            // the same declarator binding through a curried wrapper. Mirrors
+            // TreeSitterExtractor's curriedWrapperBoundName.
+            if let Some(bound) = self.curried_wrapper_bound_name(node) {
+                self.extract_function(node, Some(bound));
+                return;
+            }
             // `const handleClear = () => {…}` inside a body (#1669): named by
             // its declarator, like at module scope. Mirrors
             // TreeSitterExtractor's declaratorBoundFunction.
@@ -840,6 +868,115 @@ impl<'t> Walker<'t> {
             return None;
         }
         Some(self.text(name_node).to_string())
+    }
+
+    /// The literal name a curried factory was handed as its first argument —
+    /// `Effect.fn("Session.run")` → `Session.run` — or None when it has none.
+    ///
+    /// A plain string and a substitution-free template literal both count; the
+    /// two are interchangeable in source and carry the same name. A template
+    /// that interpolates is a computation rather than a name, and so is a
+    /// variable, so those decline and the declarator is used instead.
+    fn curried_wrapper_literal_name(&self, factory_call: Node<'t>) -> Option<String> {
+        let args = factory_call.child_by_field_name("arguments")?;
+        let first = args.named_child(0)?;
+        match first.kind() {
+            "string" => {
+                let raw = self.text(first).trim();
+                if raw.len() < 2 {
+                    return None;
+                }
+                let inner = &raw[1..raw.len() - 1];
+                let unescaped = unescape_quotes(inner);
+                if unescaped.is_empty() {
+                    None
+                } else {
+                    Some(unescaped)
+                }
+            }
+            "template_string" => {
+                // A substitution makes the text a computation rather than a
+                // name. The fragment children are the literal text and are
+                // expected.
+                for i in 0..first.named_child_count() {
+                    if first.named_child(i)?.kind() == "template_substitution" {
+                        return None;
+                    }
+                }
+                let raw = self.text(first).trim();
+                if raw.len() < 2 {
+                    return None;
+                }
+                let inner = &raw[1..raw.len() - 1];
+                if inner.is_empty() {
+                    None
+                } else {
+                    Some(inner.to_string())
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The declarator name for an anonymous function passed to a CURRIED
+    /// wrapper call — `const NAME = factory(...)(function () {…})` — or None.
+    ///
+    /// `react_hook_bound_name` above names a function through the declarator
+    /// that binds it; the shape is general, but that method is bounded to the
+    /// three React handler hooks. This is the same shape with a different,
+    /// equally decidable bound: the callee is itself a call, i.e. a factory
+    /// that returns the wrapper (#1747). Requiring that keeps it narrow —
+    /// `useMemo(|| …, [])` and `arr.map(…)` are single calls and stay
+    /// anonymous, exactly as before.
+    ///
+    /// Generators are admitted here and not in `react_hook_bound_name`: a
+    /// React handler is never a generator, while `function*` is the common
+    /// form in the ecosystem this shape comes from.
+    ///
+    /// Mirrors TreeSitterExtractor's curriedWrapperBoundName.
+    fn curried_wrapper_bound_name(&self, node: Node<'t>) -> Option<String> {
+        if !matches!(
+            node.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        ) {
+            return None;
+        }
+        let args = node.parent()?;
+        if args.kind() != "arguments" {
+            return None;
+        }
+        let first = args.named_child(0)?;
+        if first.start_byte() != node.start_byte() || first.end_byte() != node.end_byte() {
+            return None;
+        }
+        let call = args.parent()?;
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        // The bound that replaces the hook allowlist: the thing being called
+        // is itself a call, so this is a curried wrapper's second application.
+        let callee = call.child_by_field_name("function")?;
+        if callee.kind() != "call_expression" {
+            return None;
+        }
+        let declarator = call.parent()?;
+        if declarator.kind() != "variable_declarator" {
+            return None;
+        }
+        let name_node = declarator.child_by_field_name("name")?;
+        if name_node.kind() != "identifier" {
+            return None;
+        }
+        // A name the factory was handed in the source beats the declarator,
+        // because it is the one the author qualified: `Effect.fn("Session.run")`
+        // says the function is `run` of `Session`, while the declarator only
+        // says `run`. Falls back to the declarator whenever the factory carries
+        // no literal name. Mirrors TreeSitterExtractor's
+        // curriedWrapperLiteralName.
+        Some(
+            self.curried_wrapper_literal_name(callee)
+                .unwrap_or_else(|| self.text(name_node).to_string()),
+        )
     }
 
     /// extractName / extractNameRaw for the TS/JS configs.
