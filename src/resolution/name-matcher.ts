@@ -786,11 +786,16 @@ export function matchWrappedLocalName(
       (o) => isFn(o) && o.id !== scope.id && contains(scope, o) && contains(o, n),
     );
 
+  // Only the extractor's wrapper-named nodes are candidates, and their mark is
+  // a dot in the NAME itself (`Ns.helper`) — the wrapper's debug string became
+  // the name. A qualified-name suffix would be the wrong test: `Record::serialize`
+  // ends with `::serialize` for every ordinary method, so keying on that made
+  // every same-named method a candidate and let this matcher answer before the
+  // rule that a receiver-less JS/TS call never binds to a method (#1714).
   const dotted = `.${ref.referenceName}`;
-  const scoped = `::${ref.referenceName}`;
   const candidates = nodesInFile.filter((n) => {
     if (!isFn(n)) return false;
-    if (!n.name.endsWith(dotted) && !n.qualifiedName.endsWith(scoped)) return false;
+    if (!n.name.endsWith(dotted)) return false;
     if (innermostScope) {
       return directInScope(n, innermostScope) || isModuleScope(n);
     }
