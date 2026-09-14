@@ -330,11 +330,15 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   method name when the receiver is another call, avoiding false self-edges
   such as `Provider.configure().model()` resolving to a local `model` function.
 
-### Fixes
-
 - TypeScript and JavaScript functions wrapped in string-named higher-order
   calls (such as `Effect.fn("Session.run")`) are now indexed with their
   logical names and bodies, including native-kernel extraction.
+
+- A TypeScript or JavaScript class field holding a generator function —
+  `class Repo { loadAll = function* () {…} }`, directly or through a wrapper
+  call — is now indexed as a method rather than a plain property, on both
+  extraction paths. Previously it got no callable node, so nothing could call
+  it and the calls in its body were attributed to the file instead.
 
 ## [1.6.0] - 2026-08-26
 

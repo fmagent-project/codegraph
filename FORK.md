@@ -18,6 +18,10 @@ fork's generator patch reached only the expression form, and its chained-call
 patch removed the false edge by refusing to match at all, which also killed
 legitimate ones.
 
+Upstream's generator fix stops short in one place — the two helpers that read a
+class field's value still do not list `generator_function` — so the part of the
+fork's patch covering that shape stays, as patch 4 below.
+
 The previous base was `v1.6.0` (2026-08-26), 60 commits behind this point; it
 carried fixes for Rust field-receiver resolution
 ([#1585](https://github.com/colbymchenry/codegraph/issues/1585)), generic `impl`
@@ -29,7 +33,7 @@ Upstream shipped the C macro-attribute extraction fix (issue #1211, PR #1311) in
 v1.5.0, so the base carries it natively; the fork no longer needs its own patch
 for it.
 
-**Patches:** three, listed below, each one file of behaviour plus the regression
+**Patches:** five, listed below, each one file of behaviour plus the regression
 test that catches its loss. Apart from them the tree matches the pinned base, so
 the fork stays cheap to re-sync. Every patch lives as a merged pull request here
 and must be **re-applied on each upstream sync** — if a merge drops one, this list
@@ -57,6 +61,10 @@ has no structural precondition.
 | `__tests__/fm-agent-wrapper-named-functions.test.ts` | Regression cover for the patch above. Pins a wrapped generator and a wrapped arrow, each with its qualified name and its body's call attributed to it rather than to the file; the service-object-returned-from-a-function shape, which is what distinguishes this from a declarator-bound approach; and an ordinary `items.map((i) => …)` callback staying anonymous, so the graph gains no node for it. |
 | `src/resolution/name-matcher.ts`, `src/resolution/index.ts` | **Effect-TS resolution.** The names patch 2 mints are qualified (`Session.helper`) while call sites are bare (`helper()`), so the edge landed on the same-named constant rather than the function — the call relation between two functions was lost. Two uniqueness/scope/import-gated matchers close that, plus a pre-filter escape in `index.ts` so a tail-named ref survives the symbol-existence check long enough to reach them. The candidate test keys on a dot in the **name** (`Ns.helper`), which is the extractor's mark for a wrapper-named node. It must not also accept a qualified-name suffix: `Record::serialize` ends with `::serialize` for every ordinary method, so that made every same-named method a candidate and let this answer before upstream's rule that a receiver-less JS/TS call never binds to a method (#1714). |
 | `__tests__/fm-agent-effect-ts-resolution.test.ts` | Regression cover for the patch above: bare call to a wrapper-named local, a same-file target beating a cross-file bare name, ambiguity and sibling-scope declines, `yield* Ns.Service` member resolution, the shadow decline, the `Ns.Service.create` factory hop, and the plain variable-declarator path staying untouched. |
+| `src/extraction/languages/typescript.ts`, `src/extraction/languages/javascript.ts` | **Generator class fields.** A class field holding a generator — `class Repo { loadAll = function* () {…} }`, directly or through a wrapper call — is a method written as a field. Two helpers decide that, one classifying the field and one finding the body to walk, and each lists the node types a field's value may have. Without `generator_function` on those lists the field is a property: no callable node, and the calls in its body attribute to the file. The native kernel already lists it (`codegraph-kernel/src/tsjs/mod.rs`), so this is the walker half of a pair that has to move together — with one side updated the same source is a method on one extraction path and a property on the other. |
+| `__tests__/fm-agent-generator-class-field.test.ts` | Regression cover for the patch above, in TypeScript and JavaScript: the field is a method under its class's qualified name, the wrapped form is too, its body's call is attributed to it rather than to the file, and both extraction paths return identical nodes, edges and refs for the same source. |
+| `src/extraction/languages/dart.ts`, `codegraph-kernel/src/dart.rs` | **Dart extension types.** Dart 3.3's `extension_type_declaration` was listed among neither path's class types, though the older `extension_declaration` was — three lists in all, one in the walker and two in the kernel. Each path was then wrong in its own way: the walker never entered the body, so a `double get km => …` got no node and the member after it had its span cut short at the signature line; the kernel reached the members through a fallback but minted them as top-level functions, with no type node for them to belong to. Listing the node type in all three is the whole fix. **Temporary** — the same change is [upstream PR #1865](https://github.com/colbymchenry/codegraph/pull/1865) for [#1784](https://github.com/colbymchenry/codegraph/issues/1784); drop this patch once that merges and the base moves past it. Until then it is also what keeps `kernel-dart-parity` green here: upstream `main` fails four of its cases, built and run on its own to confirm, and upstream has no CI workflow, so this fork's `ci.yml` is where that gate actually runs. |
+| `__tests__/fm-agent-dart-extension-type.test.ts` | Regression cover for the patch above: an extension type is a type node of its own with its members as methods under it; the member after a getter keeps its full span; and an ordinary class is unchanged. Goes with the patch when upstream's lands. |
 
 A sync brings new upstream test files in on its own — they are separate files, so
 git takes them without asking. The case to watch for is upstream *moving* the test
