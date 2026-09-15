@@ -3,34 +3,68 @@
 FM-Agent's maintenance fork of
 [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph).
 
-**Pinned base:** upstream `v1.6.0` (2026-08-26) — a tagged release, as the policy
-below prefers. It carries fixes for the three issues reported upstream from this
-project since the previous base: Rust field-receiver resolution
+**Pinned base:** upstream `3ed73bc` (`main`, 2026-09-13) — an untagged commit, the
+exception the policy below allows: upstream has not tagged since `v1.6.0`, and two
+fixes this fork had been carrying its own versions of live only on `main`.
+
+It carries fixes for two more issues reported upstream from this project —
+TS/JS generator functions
+([#1741](https://github.com/colbymchenry/codegraph/issues/1741)) and C++ pure
+virtual methods
+([#1727](https://github.com/colbymchenry/codegraph/issues/1727)) — plus a chained
+call no longer collapsing to a bare method name (upstream's own #1759). Both of
+the first two replace fork patches, and both upstream versions are wider: the
+fork's generator patch reached only the expression form, and its chained-call
+patch removed the false edge by refusing to match at all, which also killed
+legitimate ones.
+
+Upstream's generator fix stops short in one place — the two helpers that read a
+class field's value still do not list `generator_function` — so the part of the
+fork's patch covering that shape stays, as patch 4 below.
+
+The previous base was `v1.6.0` (2026-08-26), 120 commits behind this point (115
+of them not merges); it carried fixes for Rust field-receiver resolution
 ([#1585](https://github.com/colbymchenry/codegraph/issues/1585)), generic `impl`
 ownership ([#1588](https://github.com/colbymchenry/codegraph/issues/1588)) and
 Erlang per-arity identity
-([#1610](https://github.com/colbymchenry/codegraph/issues/1610)). The previous
-base was `c6aaa20` (upstream `main`, 2026-08-07), 27 commits behind this tag; see
-issue #10 for the full rationale of this sync.
+([#1610](https://github.com/colbymchenry/codegraph/issues/1610)).
 
 Upstream shipped the C macro-attribute extraction fix (issue #1211, PR #1311) in
 v1.5.0, so the base carries it natively; the fork no longer needs its own patch
 for it.
 
-**Patches:** five, listed below (the chained-call fixes `95f99a8`/`a89e7a3`
-upstream of this list predate the table). Apart from them the tree matches the
-pinned base,
-so the fork stays cheap to re-sync. Every patch lives as a merged pull request here
+**Patches:** five, listed below, each one file of behaviour plus the regression
+test that catches its loss. Apart from them the tree matches the pinned base, so
+the fork stays cheap to re-sync. Every patch lives as a merged pull request here
 and must be **re-applied on each upstream sync** — if a merge drops one, this list
 is what catches it.
+
+Patches 2 and 3 are a pair: patch 2 names a function a string-named wrapper
+wraps, and patch 3 resolves the qualified names patch 2 mints. Both go when
+upstream ships an equivalent for
+[#1747](https://github.com/colbymchenry/codegraph/issues/1747).
+
+[PR #1814](https://github.com/colbymchenry/codegraph/pull/1814) there is not
+that equivalent. It names such a function after the declarator that binds it,
+which requires the wrapper's result to land in a binding the walk recognises;
+an Effect service is usually an object *returned from inside a function*, and
+its members are never reached. Measured on `sst/opencode`: 825 of 1,056
+string-named wrappers, against 1,055 for the approach below, which asks whether
+a wrapper encloses the function wherever an anonymous function is walked and so
+has no structural precondition.
 
 | File | Patch |
 |------|-------|
 | `src/extraction/index.ts` | `fm_agent` added to `DEFAULT_IGNORE_DIRS`. FM-Agent writes its work directory into the project it analyses, holding one copy of every function it extracts plus the scripts staged to produce them, so indexing it lists each function twice and mixes tool code in with project code. Upstream deliberately keeps names that could be real source out of that list, so this stays fork-only; a project that does own an `fm_agent/` directory opts back in with a `.gitignore` negation (`!fm_agent/`). |
 | `__tests__/fm-agent-workdir-exclusion.test.ts` | Regression cover for the patch above, so a sync that drops or widens it fails `npm test` instead of shipping. Pins four things: the exclusion applies at the root and at any depth; it is a whole-name match, so `fm_agent_data/` and `my_fm_agent/` stay indexed; a `.gitignore` negation takes the directory back; and none of it depends on git. |
-| `src/resolution/name-matcher.ts` | Effect-TS resolution bridge, two uniqueness/scope/import-gated strategies. `matchWrappedLocalName` resolves a bare call to the same-file function the extractor named after a wrapper debug string (`Effect.fn("Ns.name")(fn)` — local consts are unindexed, so exact-name matching failed or bound a cross-file same-named function); it runs before global exact-name matching, so a same-file wrapper target beats a unique global bare name. The `mc-effect-svc` branch of `matchMethodCall` recovers a service local's namespace from its own `const x = yield* Ns.Service` declaration (one `Ns.create(...)` factory hop included; a shadowing or non-service re-bind declines) and resolves the member to a unique `Ns.method` node when the file imports `Ns`. |
-| `src/resolution/index.ts` | Pre-filter escape for the patch above: wrapper-named members are indexed under the wrapper string (`Ns.helper`) while refs name only the tail (`helper`, `state.assertNotBusy`), so the symbol-existence check killed them before the matcher ran. `matchesWrapperNamedMember` (TS/JS `calls` refs only) lets a ref through when any node name carries its tail segment; a pass buys a lookup, not an edge. |
-| `__tests__/effect-ts-resolution.test.ts` | End-to-end cover for the patch pair above: bare call → wrapper-named local, same-file target beating a cross-file bare name, ambiguity and sibling-scope declines, `yield* Ns.Service` member resolution, shadow decline, the `Ns.Service.create` factory hop, and the plain variable-declarator path staying untouched. |
+| `src/extraction/tree-sitter.ts`, `codegraph-kernel/src/tsjs/mod.rs`, `codegraph-kernel/src/tsjs/extractors.rs` | **Wrapper naming.** `Effect.fn("Session.run")(function* () {…})` is anonymous only syntactically: the name is the wrapper's first argument, and it is the one a trace or a log shows. Without a node the function is absent from the graph — its callers have nothing to point at, and its body's calls attribute to whatever encloses it, so a file or an outer function gains an outgoing edge that belongs to it. The test asks, wherever an anonymous function is walked, whether a `fn` / `fnUntraced` wrapper with a string-literal first argument encloses it; having no structural precondition is what lets it reach a service object returned from inside a function, the common Effect shape. The wrapper string becomes the qualified name (`Session::run`), since it already carries the qualification the author wrote. Both extraction paths carry it — the native kernel runs by default. |
+| `__tests__/fm-agent-wrapper-named-functions.test.ts` | Regression cover for the patch above. Pins a wrapped generator and a wrapped arrow, each with its qualified name and its body's call attributed to it rather than to the file; the service-object-returned-from-a-function shape, which is what distinguishes this from a declarator-bound approach; and an ordinary `items.map((i) => …)` callback staying anonymous, so the graph gains no node for it. |
+| `src/resolution/name-matcher.ts`, `src/resolution/index.ts` | **Effect-TS resolution.** The names patch 2 mints are qualified (`Session.helper`) while call sites are bare (`helper()`), so the edge landed on the same-named constant rather than the function — the call relation between two functions was lost. Two uniqueness/scope/import-gated matchers close that, plus a pre-filter escape in `index.ts` so a tail-named ref survives the symbol-existence check long enough to reach them. The candidate test keys on a dot in the **name** (`Ns.helper`), which is the extractor's mark for a wrapper-named node. It must not also accept a qualified-name suffix: `Record::serialize` ends with `::serialize` for every ordinary method, so that made every same-named method a candidate and let this answer before upstream's rule that a receiver-less JS/TS call never binds to a method (#1714). |
+| `__tests__/fm-agent-effect-ts-resolution.test.ts` | Regression cover for the patch above: bare call to a wrapper-named local, a same-file target beating a cross-file bare name, ambiguity and sibling-scope declines, `yield* Ns.Service` member resolution, the shadow decline, the `Ns.Service.create` factory hop, and the plain variable-declarator path staying untouched. |
+| `src/extraction/languages/typescript.ts`, `src/extraction/languages/javascript.ts` | **Generator class fields.** A class field holding a generator — `class Repo { loadAll = function* () {…} }`, directly or through a wrapper call — is a method written as a field. Two helpers decide that, one classifying the field and one finding the body to walk, and each lists the node types a field's value may have. Without `generator_function` on those lists the field is a property: no callable node, and the calls in its body attribute to the file. The native kernel already lists it (`codegraph-kernel/src/tsjs/mod.rs`), so this is the walker half of a pair that has to move together — with one side updated the same source is a method on one extraction path and a property on the other. |
+| `__tests__/fm-agent-generator-class-field.test.ts` | Regression cover for the patch above, in TypeScript and JavaScript: the field is a method under its class's qualified name, the wrapped form is too, its body's call is attributed to it rather than to the file, and both extraction paths return identical nodes, edges and refs for the same source. |
+| `src/extraction/languages/dart.ts`, `codegraph-kernel/src/dart.rs` | **Dart extension types.** Dart 3's `extension_type_declaration` was listed among neither path's class-like node types, though the older `extension_declaration` — a near-neighbour name — was. Each path was then wrong in its own way: the walker never entered the body, so a `double get km => …` got no node and the member after it had its span cut short at the signature line; the kernel reached the members through a fallback but minted them as top-level functions, with no type node for them to belong to. Three places name it now — `extraClassNodeTypes`, the enclosing-type walk, and the kernel's two `matches!` arms. **Temporary, and kept byte-identical to [upstream PR #1865](https://github.com/colbymchenry/codegraph/pull/1865) for [#1784](https://github.com/colbymchenry/codegraph/issues/1784) so it drops out cleanly** — when that merges and the base moves past it, this patch is already what arrived. Until then it is also what keeps `kernel-dart-parity` green here: upstream `main` fails four of its cases, built and run separately to confirm, and upstream has no CI workflow, so that gate only actually runs in this fork's `ci.yml`. |
+| `__tests__/fm-agent-dart-extension-type.test.ts` | Regression cover for the patch above: an extension type is a type node of its own with its members as methods under it; the member after a getter keeps its full span; and an ordinary class is unchanged. Goes with the patch when upstream's lands. |
 
 A sync brings new upstream test files in on its own — they are separate files, so
 git takes them without asking. The case to watch for is upstream *moving* the test
@@ -39,7 +73,13 @@ stop being collected, and nothing would fail. Check the suite's file count after
 sync, not just that it is green.
 
 **Version marker:** `codegraph --version` → `1.6.0-fmagent.N` identifies a build
-from this fork. Note this is a SemVer pre-release of `1.6.0`, so it sorts *below*
+from this fork. It lives in **two** files as of this base — the root `package.json`
+and `ui/package.json` — and `__tests__/ui-package.test.ts` asserts the two match.
+Upstream ships `scripts/sync-ui-version.mjs` for this, but it runs only from
+`build:lib`; neither `npm test` nor `npm run build` reaches it, so a version bump
+has to touch both files by hand or the suite goes red.
+
+Note this is a SemVer pre-release of `1.6.0`, so it sorts *below*
 plain `1.6.0`; the updater must therefore point at this fork (see below), never
 upstream, or it would advertise a "downgrade to upstream" as an upgrade.
 
