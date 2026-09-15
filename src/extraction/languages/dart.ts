@@ -34,13 +34,14 @@ function dartConstructorSignature(node: SyntaxNode): SyntaxNode | undefined {
   return undefined;
 }
 
-/** The name of the class/mixin/extension/enum lexically enclosing `node`. */
+/** The name of the class/mixin/extension/extension type/enum lexically enclosing `node`. */
 function dartEnclosingTypeName(node: SyntaxNode): string | undefined {
   let p = node.parent;
   while (p) {
     if (
       p.type === 'class_definition' || p.type === 'mixin_declaration' ||
-      p.type === 'extension_declaration' || p.type === 'enum_declaration'
+      p.type === 'extension_declaration' || p.type === 'extension_type_declaration' ||
+      p.type === 'enum_declaration'
     ) {
       return p.childForFieldName('name')?.text;
     }
@@ -117,11 +118,7 @@ function dartCalleeOfArgPart(argPart: SyntaxNode): string | undefined {
 
 export const dartExtractor: LanguageExtractor = {
   functionTypes: ['function_signature'],
-  // `extension_type_declaration` is Dart 3.3's extension type. Its members sit
-  // in an ordinary `class_body`, so listing it here is all it takes for them to
-  // be walked; without it the body is never entered, its getters get no node,
-  // and the members that follow end up with their spans cut short.
-  classTypes: ['class_definition', 'extension_type_declaration'],
+  classTypes: ['class_definition'],
   // `method_signature` covers regular methods AND factory constructors (which
   // parse as method_signature > factory_constructor_signature). A plain named
   // constructor `Foo._()` parses as a bare `constructor_signature`, so include
@@ -136,7 +133,11 @@ export const dartExtractor: LanguageExtractor = {
   importTypes: ['import_or_export'],
   callTypes: [],  // Dart calls use identifier+selector, handled via extractBareCall
   variableTypes: [],
-  extraClassNodeTypes: ['mixin_declaration', 'extension_declaration'],
+  // `extension_type_declaration` is Dart 3's extension type. It sits beside the
+  // older `extension_declaration` — near-neighbour names — and its members live
+  // in an ordinary `class_body`, so it belongs on this list for the same reason
+  // the other two do.
+  extraClassNodeTypes: ['mixin_declaration', 'extension_declaration', 'extension_type_declaration'],
   // A Dart `static_final_declaration` is exactly a top-level or class-`static`
   // `const`/`final` — the shared-constant idiom — so extract it as `constant`
   // for value-reference edges. Instance fields, `var`, and typed declarations
