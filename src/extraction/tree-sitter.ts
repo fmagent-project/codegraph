@@ -1680,7 +1680,16 @@ export class TreeSitterExtractor {
   }
 
   /**
-   * Extract a function
+   * The name a string-named wrapper gives the function it wraps —
+   * `Effect.fn("Session.run")(function* () {…})` → `Session.run` — for a
+   * wrapper whose result is bound to nothing, or undefined.
+   *
+   * Upstream names a wrapped function after the binding its result lands in
+   * (#1747, `curriedWrapperBoundName`): the declarator, or an object member's
+   * key. That binding is the identifier every call site uses, so wherever one
+   * exists it wins. What is left is a wrapper passed as an argument to another
+   * call, an array element, an arrow body or a return value: nothing names the
+   * function there except the wrapper's own string.
    */
   private wrappedFunctionName(node: SyntaxNode): string | undefined {
     if (
@@ -1689,6 +1698,7 @@ export class TreeSitterExtractor {
       this.language !== 'javascript' &&
       this.language !== 'jsx'
     ) return undefined;
+    if (this.curriedWrapperBoundName(node)) return undefined;
 
     const argumentsNode = node.parent;
     const call = argumentsNode?.parent;
@@ -1708,6 +1718,9 @@ export class TreeSitterExtractor {
     return raw.slice(1, -1).replace(/\\([\\'\"])/g, '$1') || undefined;
   }
 
+  /**
+   * Extract a function
+   */
   private extractFunction(node: SyntaxNode, nameOverride?: string): void {
     if (!this.extractor) return;
 

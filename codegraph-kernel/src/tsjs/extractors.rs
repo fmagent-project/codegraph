@@ -14,7 +14,15 @@ use tree_sitter::Node;
 impl<'t> Walker<'t> {
     // --- extractFunction --------------------------------------------------------
 
+    /// The name a string-named wrapper gives the function it wraps, for a
+    /// wrapper whose result is bound to nothing. Where upstream finds a binding
+    /// (`curried_wrapper_bound_name`: a declarator, or an object member's key)
+    /// that binding wins, being what call sites use. Mirrors
+    /// TreeSitterExtractor's wrappedFunctionName.
     pub(super) fn wrapped_function_name(&self, node: Node<'t>) -> Option<String> {
+        if self.curried_wrapper_bound_name(node).is_some() {
+            return None;
+        }
         let arguments = node.parent()?;
         let call = arguments.parent()?;
         if arguments.kind() != "arguments" || call.kind() != "call_expression" {
