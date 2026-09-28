@@ -1,24 +1,30 @@
 /**
- * Effect-TS resolution: wrapper-named functions and service receivers.
+ * Effect-TS resolution: calls into a service's members.
  *
- * Two structural gaps this suite pins:
+ * Upstream names a wrapped function after the binding its result lands in
+ * (#1747, PR #2002), so `const helper = Effect.fn("Ns.helper")(…)` is a node
+ * named `helper` and a bare `helper()` resolves the ordinary way. What that
+ * leaves unresolved is the call Effect code is mostly made of — a service
+ * member reached through the service:
  *
- * 1. `const helper = Effect.fn("Ns.helper")(function* …)` — the extractor
- *    names the function node after the wrapper's debug string (`Ns.helper`),
- *    while call sites use the binding's bare name (`helper(...)`). Local
- *    consts are not indexed as nodes, so nothing is named `helper`: exact
- *    name matching fails outright, or binds a same-named function in an
- *    unrelated file. Resolution bridges the names by suffix — a unique
- *    same-file `Ns.<name>` function visible from the call site's scope —
- *    and declines on ambiguity or cross-scope candidates.
+ *     const state = yield* SessionRunState.Service
+ *     state.assertNotBusy()
  *
- * 2. `const state = yield* SessionRunState.Service; state.assertNotBusy()` —
- *    the receiver's type lives only in the Effect type system, so no
- *    source-level inference applies. The binding text plus the wrapper
- *    naming convention recover it: the receiver's own nearest declaration
- *    names the service namespace, the file must import it, and the member
- *    must be a unique `Ns.method` node. Shadows and non-service
- *    initializers decline.
+ * `state` has no source-level type, and the member lives in an object a
+ * factory returns rather than as an export, so neither receiver inference nor
+ * import resolution reaches it; a direct `EventV2.readAggregate(…)` on an
+ * imported namespace fails the same way. The one place the namespace is
+ * written down is the wrapper's string, `Effect.fn("SessionRunState.assertNotBusy")`,
+ * on the member's own line. So: take the namespace from the receiver's own
+ * nearest declaration, or from the receiver itself when it is a capitalised
+ * name; require the calling file to import it; and resolve only a unique
+ * member whose wrapper string is `Ns.method`. A shadow, a non-service
+ * initializer, a missing import or two candidates decline.
+ *
+ * Also pinned: a bare call never reaches a wrapper by its string's tail. The
+ * fork used to bridge `helper()` to a node named `Ns.helper`, which minted an
+ * edge whenever the tail happened to match — `const invoke =
+ * Effect.fn("Service.run")(…)` made every bare `run()` a call to it.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
@@ -26,7 +32,9 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { CodeGraph } from '../src';
 
-describe('Effect-TS wrapper naming and service receivers', () => {
+type Edge = { src: string; tgt: string; tgtFile: string };
+
+describe('Effect-TS service member resolution (fork patch)', () => {
   let dir: string;
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'effect-ts-'));
@@ -41,168 +49,125 @@ describe('Effect-TS wrapper naming and service receivers', () => {
     fs.writeFileSync(p, body);
   };
 
-  const load = async () => {
+  const load = async (): Promise<Edge[]> => {
     const cg = await CodeGraph.init(dir, { silent: true });
     await cg.indexAll();
     const db = (cg as any).db.db;
-    const edges: { src: string; tgt: string }[] = db
+    const edges: Edge[] = db
       .prepare(
-        `SELECT s.name src, t.name tgt FROM edges e
+        `SELECT s.name src, t.name tgt, t.file_path tgtFile FROM edges e
          JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
          WHERE e.kind = 'calls'`,
       )
       .all();
-    const names: string[] = db.prepare(`SELECT name FROM nodes`).all().map((r: any) => r.name);
     cg.close?.();
-    return { edges, names };
+    return edges;
   };
-  const hasCall = (edges: { src: string; tgt: string }[], src: string, tgt: string) =>
+  const calls = (edges: Edge[], src: string, tgt: string, tgtFile?: string) =>
+    edges.some((e) => e.src === src && e.tgt === tgt && (!tgtFile || e.tgtFile === tgtFile));
+  const callsAny = (edges: Edge[], src: string, tgt: string) =>
     edges.some((e) => e.src === src && e.tgt === tgt);
 
-  it('resolves a bare call to a wrapper-named function-local const', async () => {
-    write(
-      'svc.ts',
-      `function createProcessor() {
-  const helper = Effect.fn("Ns.helper")(function* (x: number) {
-    return x;
-  });
-
-  function caller(a: number) {
-    const r = helper(a);
-    return r;
-  }
-
-  return { caller };
-}
-export const processor = createProcessor();
-`,
-    );
-    const { edges, names } = await load();
-    // Extraction prerequisite: the node carries the wrapper string's name.
-    expect(names).toContain('Ns.helper');
-    expect(hasCall(edges, 'caller', 'Ns.helper')).toBe(true);
-  });
-
-  it('prefers the same-file wrapper target over a cross-file bare name', async () => {
-    write(
-      'svc.ts',
-      `function createProcessor() {
-  const helper = Effect.fn("Ns.helper")(function* (x: number) {
-    return x;
-  });
-
-  function caller(a: number) {
-    return helper(a);
-  }
-
-  return { caller };
-}
-export const processor = createProcessor();
-`,
-    );
-    // A unique global bare-named `helper` — exactly the shape that bound
-    // `createUserMessage(...)` to a test file before the bridge ran.
-    write('other.ts', `export function helper(x: number) { return x + 1; }\n`);
-    const { edges } = await load();
-    expect(hasCall(edges, 'caller', 'Ns.helper')).toBe(true);
-    expect(hasCall(edges, 'caller', 'helper')).toBe(false);
-  });
-
-  it('declines when two visible wrapper targets share the tail', async () => {
-    write(
-      'svc.ts',
-      `function createTwo() {
-  const helperA = Effect.fn("Ns.helper")(function* () { return 1; });
-  const helperB = Effect.fn("Other.helper")(function* () { return 2; });
-
-  function caller() {
-    return helper(0);
-  }
-
-  return { caller };
-}
-export const two = createTwo();
-`,
-    );
-    const { edges } = await load();
-    expect(hasCall(edges, 'caller', 'Ns.helper')).toBe(false);
-    expect(hasCall(edges, 'caller', 'Other.helper')).toBe(false);
-  });
-
-  it('declines a wrapper target visible only in a sibling scope', async () => {
-    write(
-      'svc.ts',
-      `function makeA() {
-  const helper = Effect.fn("Ns.helper")(function* () { return 1; });
-  return helper;
-}
-
-function makeB() {
-  function caller() {
-    return helper(0);
-  }
-  return { caller };
-}
-
-export const a = makeA();
-export const b = makeB();
-`,
-    );
-    const { edges } = await load();
-    expect(hasCall(edges, 'caller', 'Ns.helper')).toBe(false);
-  });
-
-  it('resolves a member call on a yield*-bound service local', async () => {
+  // Two services with a same-named member, so a name alone cannot pick one:
+  // only the wrapper string tells them apart.
+  const writeServices = () => {
     write(
       'run-state.ts',
       `export const SessionRunState = { Service: null as any };
 
 function makeState() {
-  const assertNotBusy = Effect.fn("SessionRunState.assertNotBusy")(function* () {
-    return;
-  });
-  return { assertNotBusy };
+  return {
+    assertNotBusy: Effect.fn("SessionRunState.assertNotBusy")(function* () {
+      return;
+    }),
+  };
 }
 export const stateImpl = makeState();
 `,
     );
+    write(
+      'other-state.ts',
+      `export const OtherState = { Service: null as any };
+
+function makeOther() {
+  return {
+    assertNotBusy: Effect.fn("OtherState.assertNotBusy")(function* () {
+      return;
+    }),
+  };
+}
+export const otherImpl = makeOther();
+`,
+    );
+  };
+
+  it('resolves a member call on a yield*-bound service local', async () => {
+    writeServices();
     write(
       'loop.ts',
       `import { SessionRunState } from './run-state';
 
-const loop = Effect.fn("App.loop")(function* () {
+export const loop = Effect.fn("App.loop")(function* () {
   const state = yield* SessionRunState.Service;
   state.assertNotBusy();
 });
-
-export { loop };
 `,
     );
-    const { edges } = await load();
-    expect(hasCall(edges, 'App.loop', 'SessionRunState.assertNotBusy')).toBe(true);
+    const edges = await load();
+    expect(calls(edges, 'loop', 'assertNotBusy', 'run-state.ts')).toBe(true);
+    expect(calls(edges, 'loop', 'assertNotBusy', 'other-state.ts')).toBe(false);
+  });
+
+  it('resolves a direct call through an imported namespace, and declines without the import', async () => {
+    // A module that re-exports itself as its namespace, the way an Effect
+    // codebase often spells one; a same-named function elsewhere is the decoy.
+    write(
+      'event.ts',
+      `export * as EventV2 from "./event";
+
+export const readAggregate = Effect.fn("EventV2.readAggregate")(function* (id: string) {
+  return id;
+});
+`,
+    );
+    write(
+      'legacy.ts',
+      `export const readAggregate = Effect.fn("EventV1.readAggregate")(function* (id: string) {
+  return id;
+});
+`,
+    );
+    write(
+      'direct.ts',
+      `import { EventV2 } from './event';
+
+export const direct = Effect.fn("App.direct")(function* () {
+  yield* EventV2.readAggregate("a");
+});
+`,
+    );
+    write(
+      'unimported.ts',
+      `export const unimported = Effect.fn("App.unimported")(function* () {
+  yield* EventV2.readAggregate("a");
+});
+`,
+    );
+    const edges = await load();
+    expect(calls(edges, 'direct', 'readAggregate', 'event.ts')).toBe(true);
+    expect(calls(edges, 'direct', 'readAggregate', 'legacy.ts')).toBe(false);
+    expect(callsAny(edges, 'unimported', 'readAggregate')).toBe(false);
   });
 
   it('declines when the receiver is shadowed by a non-service binding', async () => {
-    write(
-      'run-state.ts',
-      `export const SessionRunState = { Service: null as any };
-
-function makeState() {
-  const assertNotBusy = Effect.fn("SessionRunState.assertNotBusy")(function* () {
-    return;
-  });
-  return { assertNotBusy };
-}
-export const stateImpl = makeState();
-`,
-    );
+    writeServices();
     write(
       'loop.ts',
       `import { SessionRunState } from './run-state';
 
 declare function makeRow(): any;
 
-const inner = Effect.fn("App.inner")(function* () {
+export const inner = Effect.fn("App.inner")(function* () {
   const state = yield* SessionRunState.Service;
   const nested = Effect.fn("App.nested")(function* () {
     const state = makeRow();
@@ -210,12 +175,10 @@ const inner = Effect.fn("App.inner")(function* () {
   });
   return nested;
 });
-
-export { inner };
 `,
     );
-    const { edges } = await load();
-    expect(hasCall(edges, 'App.nested', 'SessionRunState.assertNotBusy')).toBe(false);
+    const edges = await load();
+    expect(callsAny(edges, 'nested', 'assertNotBusy')).toBe(false);
   });
 
   it('resolves through one service-factory hop (Ns.Service.create)', async () => {
@@ -224,11 +187,10 @@ export { inner };
       `export const SessionProcessor = { Service: null as any };
 
 function makeProc() {
-  const process = Effect.fn("SessionProcessor.process")(function* (m: any) { return m; });
-  const create = Effect.fn("SessionProcessor.create")(function* (m: any) {
-    return { process };
-  });
-  return { process, create };
+  return {
+    process: Effect.fn("SessionProcessor.process")(function* (m: any) { return m; }),
+    create: Effect.fn("SessionProcessor.create")(function* (m: any) { return m; }),
+  };
 }
 export const procImpl = makeProc();
 `,
@@ -237,33 +199,42 @@ export const procImpl = makeProc();
       'consumer.ts',
       `import { SessionProcessor } from './processor';
 
-const run = Effect.fn("App.run")(function* (msg: any) {
+export const run = Effect.fn("App.run")(function* (msg: any) {
   const processors = yield* SessionProcessor.Service;
   const processor = yield* processors.create(msg);
   yield* processor.process(msg);
 });
-
-export { run };
 `,
     );
-    const { edges } = await load();
-    expect(hasCall(edges, 'App.run', 'SessionProcessor.create')).toBe(true);
-    expect(hasCall(edges, 'App.run', 'SessionProcessor.process')).toBe(true);
+    const edges = await load();
+    expect(calls(edges, 'run', 'create', 'processor.ts')).toBe(true);
+    expect(calls(edges, 'run', 'process', 'processor.ts')).toBe(true);
   });
 
-  it('leaves the standard variable-declarator path untouched', async () => {
+  it('never resolves a bare call to a wrapper by its string tail', async () => {
     write(
-      'plain.ts',
-      `const double = (x: number) => x * 2;
+      'svc.ts',
+      `function run() { return 2; }
 
-function useIt(v: number) {
-  return double(v);
+const invoke = Effect.fn("Service.run")(function* () { return 1; });
+
+export default Runtime.handler("x", Effect.fn("cli.api")(function* () { return 1; }));
+
+declare function api(): void;
+
+export function caller() {
+  invoke();
+  run();
+  api();
 }
-
-export { useIt, double };
 `,
     );
-    const { edges } = await load();
-    expect(hasCall(edges, 'useIt', 'double')).toBe(true);
+    const edges = await load();
+    // The binding names the wrapped function, and the plain `run` keeps its
+    // own call.
+    expect(calls(edges, 'caller', 'invoke', 'svc.ts')).toBe(true);
+    expect(calls(edges, 'caller', 'run', 'svc.ts')).toBe(true);
+    // `cli.api` is bound to nothing; no call site can name it.
+    expect(callsAny(edges, 'caller', 'cli.api')).toBe(false);
   });
 });
