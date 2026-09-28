@@ -389,26 +389,21 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
-- TypeScript and JavaScript higher-order wrappers that name a function through
-  a debug string — Effect-TS `Effect.fn("Ns.name")(fn)` — no longer sever the
-  call graph. Bare calls to the wrapper's local binding (`readToolCall(...)`)
-  now resolve to the wrapper-named node when exactly one is visible from the
-  call site's scope, instead of failing outright or binding a same-named
-  function in an unrelated file; and member calls on service locals bound
+- A TypeScript or JavaScript function wrapped in a string-named wrapper whose
+  result nothing binds — `Runtime.handler(cmd, Effect.fn("cli.api")(fn))`, an
+  array element, an arrow body, a return value — is now indexed under the
+  wrapper's string (`cli.api`, qualified `cli::api`), on both extraction paths.
+  Where the result does land in a declarator or an object member, the binding
+  names the function, as upstream does since #1747.
+
+- Calls into an Effect-TS service's members now resolve: through a local bound
   with `const x = yield* Ns.Service` (including one `Ns.create(...)` factory
-  hop) resolve to the service's `Ns.member` nodes. Both paths decline on
-  ambiguity, cross-scope candidates, a missing import, or a shadowing
-  re-bind. On an Effect-heavy codebase this replaces hundreds of wrong
-  cross-file bare-name edges (calls landing on test helpers and unrelated
-  classes) with the correct targets.
-
-- TypeScript and JavaScript chained method calls no longer collapse to a bare
-  method name when the receiver is another call, avoiding false self-edges
-  such as `Provider.configure().model()` resolving to a local `model` function.
-
-- TypeScript and JavaScript functions wrapped in string-named higher-order
-  calls (such as `Effect.fn("Session.run")`) are now indexed with their
-  logical names and bodies, including native-kernel extraction.
+  hop), or directly on an imported namespace (`EventV2.readAggregate(...)`).
+  The target is the member whose wrapper string is `Ns.method`, read from the
+  member's own line. They decline on ambiguity, a missing import, or a
+  shadowing re-bind. A bare call no longer reaches a wrapped function through
+  the tail of its string, which minted an edge whenever the tail happened to
+  match another name.
 
 - A TypeScript or JavaScript class field holding a generator function —
   `class Repo { loadAll = function* () {…} }`, directly or through a wrapper
