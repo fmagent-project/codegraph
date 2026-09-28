@@ -20,8 +20,7 @@
 //!   kind is always `variable`, no signature, and EVERY direct `identifier`
 //!   child mints a node (`const MAX: u32 = OTHER;` → two nodes, `MAX` + the
 //!   phantom `OTHER`). Top-level initializer values are never body-walked.
-//! - Unit structs (`struct Unit;`, no body field) mint NO node; `mod_item`
-//!   mints no module node and adds no QN prefix.
+//! - `mod_item` mints no module node and adds no QN prefix.
 //! - Chained-call re-encode is scoped_identifier-gated (`Foo::new().bar()` →
 //!   `Foo::new().bar`); a call through a field of the enclosing type keeps
 //!   the owner-field shape (`self.inner.run()` → `self.inner.run`, #1585);
@@ -77,6 +76,7 @@ struct Scope {
 #[derive(Default)]
 struct Extra {
     docstring: Option<String>,
+    decorators: Option<String>,
     signature: Option<String>,
     return_type: Option<String>,
     qualified_name: Option<String>,
@@ -112,6 +112,7 @@ pub struct Walker<'t> {
     file_path: &'t str,
     line_starts: Vec<usize>,
     arena: Arena,
+    node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
     stack: Vec<Scope>,
     nodes_meta: Vec<NodeMeta>,
@@ -143,6 +144,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         file_path,
         line_starts: util::line_starts(source),
         arena: Arena::default(),
+        node_id_allocator: ids::NodeIdAllocator::default(),
         tables: Tables::default(),
         stack: Vec::new(),
         nodes_meta: Vec::new(),
@@ -252,7 +254,8 @@ impl<'t> Walker<'t> {
             return None;
         }
         let start_line = self.line_of(node);
-        let id = ids::node_id(self.file_path, kind, name, start_line);
+        let column = self.col_of(node);
+        let id = self.node_id_allocator.generate(self.file_path, kind, name, start_line, column);
         let end_line = node.end_position().row as u32 + 1;
 
         let qualified = extra.qualified_name.unwrap_or_else(|| {
@@ -282,6 +285,7 @@ impl<'t> Walker<'t> {
         let id_ref = self.arena.put(&id);
         let doc_ref = opt_str(&mut self.arena, extra.docstring.as_deref());
         let sig_ref = opt_str(&mut self.arena, extra.signature.as_deref());
+        let decorators_ref = opt_str(&mut self.arena, extra.decorators.as_deref());
         let ret_ref = opt_str(&mut self.arena, extra.return_type.as_deref());
         let row = self.tables.push_node(&NodeRow {
             kind: node_kind_index(kind).unwrap(),
@@ -296,7 +300,7 @@ impl<'t> Walker<'t> {
             id: id_ref,
             docstring: doc_ref,
             signature: sig_ref,
-            decorators: NONE_STR,
+            decorators: decorators_ref,
             type_parameters: NONE_STR,
             return_type: ret_ref,
             extra_json: NONE_STR,
@@ -516,7 +520,31 @@ impl<'t> Walker<'t> {
             return;
         }
 
+        // Match the wasm walker's sibling-attribute handling for Tauri commands.
+        let mut decorators = None;
+        if node.kind() == "function_item" {
+            let mut sibling = node.prev_named_sibling();
+            while let Some(item) = sibling {
+                match item.kind() {
+                    "line_comment" | "block_comment" => {},
+                    "attribute_item" => {
+                        let name = item.named_child(0).and_then(|a| a.named_child(0));
+                        if let Some(name) = name {
+                            let text: String = self.src[name.byte_range()].chars()
+                                .filter(|c| !c.is_whitespace()).collect();
+                            if text == "tauri::command" {
+                                decorators = Some("tauri::command".to_string());
+                                break;
+                            }
+                        }
+                    },
+                    _ => break,
+                }
+                sibling = item.prev_named_sibling();
+            }
+        }
         let extra = Extra {
+            decorators,
             docstring: preceding_docstring(node, self.src),
             signature: self.signature_of(node),
             visibility: Some(self.visibility_of(node)),
@@ -559,8 +587,6 @@ impl<'t> Walker<'t> {
         }
 
         self.extract_type_annotations(node, row);
-        // extractDecoratorsFor: rust attribute_items are siblings, not
-        // decorator/annotation/attribute node types — complete no-op.
         self.stack.push(Scope { row, kind, name });
         if let Some(body) = node.child_by_field_name("body") {
             self.visit_function_body(body);
@@ -590,10 +616,12 @@ impl<'t> Walker<'t> {
         self.stack.pop();
     }
 
-    /// Extract a Rust struct or union with a body; unit structs remain skipped.
+    /// Extract a Rust struct or union — the body field is OPTIONAL. A unit
+    /// struct (`struct U;`) has no body and is still a complete definition,
+    /// so it mints a node with no members; tuple structs' ordered_field_declaration_list
+    /// is a body. Mirrors the TS reference's `allowBodilessStruct`.
     fn extract_aggregate(&mut self, node: Node<'t>, kind: &'static str) {
         stack_guard!();
-        let Some(body) = node.child_by_field_name("body") else { return };
         let name = self.extract_name(node);
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
@@ -602,6 +630,10 @@ impl<'t> Walker<'t> {
         };
         let Some(row) = self.create_node(kind, &name, node, extra) else { return };
         self.extract_inheritance(node, row);
+
+        // Unit structs have no body to walk — the node itself is the whole
+        // definition.
+        let Some(body) = node.child_by_field_name("body") else { return };
 
         self.stack.push(Scope { row, kind, name });
         for i in 0..body.named_child_count() {
@@ -662,6 +694,8 @@ impl<'t> Walker<'t> {
     /// and the initializer value is never body-walked.
     fn extract_variable(&mut self, node: Node<'t>) {
         let docstring = preceding_docstring(node, self.src);
+        let name_field = node.child_by_field_name("name");
+        let mut declared: Option<(u32, String)> = None;
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i) else { continue };
             if child.kind() != "identifier" {
@@ -669,7 +703,7 @@ impl<'t> Walker<'t> {
             }
             let name = self.text(child).to_string();
             if !name.is_empty() {
-                self.create_node(
+                let row = self.create_node(
                     "variable",
                     &name,
                     child,
@@ -679,6 +713,26 @@ impl<'t> Walker<'t> {
                         ..Extra::default()
                     },
                 );
+                if let (Some(row), Some(nf)) = (row, name_field) {
+                    if child.start_byte() == nf.start_byte() {
+                        declared = Some((row, name));
+                    }
+                }
+            }
+        }
+        // Walk the initializer ATTRIBUTED to the declared symbol (#693):
+        // `const N: usize = compute()` and
+        // `static REGISTRY: Lazy<T> = Lazy::new(|| build())` dropped every call
+        // inside the initializer, so a handler table or a lazily-built
+        // singleton linked to nothing.
+        if let Some(value) = node.child_by_field_name("value") {
+            match declared {
+                Some((row, name)) => {
+                    self.stack.push(Scope { row, kind: "variable", name });
+                    self.visit_function_body(value);
+                    self.stack.pop();
+                }
+                None => self.visit_function_body(value),
             }
         }
     }
@@ -867,9 +921,17 @@ impl<'t> Walker<'t> {
                                     _ => callee_name = method_name.to_string(),
                                 }
                             }
+                            // `self.method()` — keep the `self.` prefix so the
+                            // resolver can read the owner off the calling
+                            // method's qualified name and resolve the method on
+                            // THAT type, instead of matching a bare name by file
+                            // proximity (#1861). Mirrors the wasm extractor.
+                            "self" => {
+                                callee_name = format!("self.{method_name}");
+                            }
                             _ => {
-                                // parenthesized, await_expression, `self` —
-                                // bare method name.
+                                // parenthesized, await_expression — bare method
+                                // name.
                                 callee_name = method_name.to_string();
                             }
                         }

@@ -124,6 +124,7 @@ pub struct Walker<'t> {
     file_path: &'t str,
     line_starts: Vec<usize>,
     arena: Arena,
+    node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
     stack: Vec<Scope>,
     nodes_meta: Vec<NodeMeta>,
@@ -157,6 +158,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         file_path,
         line_starts: util::line_starts(source),
         arena: Arena::default(),
+        node_id_allocator: ids::NodeIdAllocator::default(),
         tables: Tables::default(),
         stack: Vec::new(),
         nodes_meta: Vec::new(),
@@ -300,7 +302,8 @@ impl<'t> Walker<'t> {
             return None;
         }
         let start_line = self.line_of(node);
-        let id = ids::node_id(self.file_path, kind, name, start_line);
+        let column = self.col_of(node);
+        let id = self.node_id_allocator.generate(self.file_path, kind, name, start_line, column);
         let end_line = node.end_position().row as u32 + 1; // no resolveBody for java
 
         let qualified = {
@@ -759,6 +762,16 @@ impl<'t> Walker<'t> {
                 if let Some(row) = row {
                     self.extract_decorators_for(node, row);
                     self.extract_type_annotations(node, row);
+                    // Walk the initializer ATTRIBUTED to the declared field
+                    // (#693, the Go fix): the dispatcher only fn-ref-scans this
+                    // subtree, so a lambda / method reference / anonymous class
+                    // in `private final Runnable r = () -> target();` emitted no
+                    // call edge at all.
+                    if let Some(value) = decl.child_by_field_name("value") {
+                        self.stack.push(Scope { row, kind: field_kind, name: name.clone() });
+                        self.visit_function_body(value);
+                        self.stack.pop();
+                    }
                 }
             }
         } else {

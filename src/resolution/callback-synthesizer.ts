@@ -21,14 +21,24 @@
  * need receiver-type matching, deferred to Phase 3). All synthesized edges are
  * tagged `provenance:'heuristic'`. See docs/design/callback-edge-synthesis.md.
  */
-import type { Edge, Node, NodeKind } from '../types';
+import type { Edge, Language, Node, NodeKind } from '../types';
 import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
 import { goframeRouteEdges } from './goframe-synthesizer';
+import { expoRouterReturnEdges } from './expo-router-synthesizer';
+import { nextLinkEdges } from './next-router-synthesizer';
+import { reactRouterLinkEdges } from './react-router-synthesizer';
+import { tanstackLinkEdges } from './tanstack-router-synthesizer';
+import { vueRouterLinkEdges } from './vue-router-synthesizer';
+import { svelteKitLinkEdges, svelteKitPageComponentEdges } from './sveltekit-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
+import { crossTierEdges, hasCrossTierPattern } from './tier-synthesizer';
+import { enclosingFn, makeLineAt } from './synth-utils';
+import { resolveImportPath } from './import-resolver';
+import { crossesCodeBoundary } from './name-matcher';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -39,6 +49,7 @@ const ON_RE = /\.(?:on|once|addListener)\(\s*['"]([^'"]+)['"]\s*,\s*(?:function\
 const EMIT_RE = /\.(?:emit|fire|dispatchEvent)\(\s*['"]([^'"]+)['"]/g;
 const SETSTATE_RE = /this\.setState\s*\(/;
 const FLUTTER_SETSTATE_RE = /\bsetState\s*\(/; // Flutter: setState((){…}) / this.setState
+const JS_FAMILY = ['typescript', 'javascript', 'tsx', 'jsx'];
 const JSX_TAG_RE = /<([A-Z][A-Za-z0-9_]*)[\s/>]/g;
 const MAX_JSX_CHILDREN = 30;
 // Vue SFC templates: kebab-case child components (<el-button> → ElButton) and
@@ -109,33 +120,6 @@ function sliceLines(content: string, startLine?: number, endLine?: number): stri
   return content.split('\n').slice(startLine - 1, endLine).join('\n');
 }
 
-/**
- * Per-match line resolver over `src`, 1-based at `baseLine`. The inline
- * `src.slice(0, idx).split('\n').length` idiom is O(source-length) PER MATCH,
- * which goes quadratic on a match-dense source (a generated function full of
- * `.push(` calls re-scanned tens of thousands of times was most of the #1235
- * indexing wedge). Builds the newline index once — lazily, since most sources
- * never produce a match — then answers each call with a binary search.
- */
-function makeLineAt(src: string, baseLine: number): (idx: number) => number {
-  let nl: number[] | null = null;
-  return (idx: number) => {
-    if (!nl) {
-      nl = [];
-      for (let i = src.indexOf('\n'); i !== -1; i = src.indexOf('\n', i + 1)) nl.push(i);
-    }
-    // Count newlines strictly before idx.
-    let lo = 0;
-    let hi = nl.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (nl[mid]! < idx) lo = mid + 1;
-      else hi = mid;
-    }
-    return baseLine + lo;
-  };
-}
-
 function registrarField(src: string): string | null {
   const m = src.match(/this\.(\w+)\.(?:add|push|set)\(/);
   return m ? m[1]! : null;
@@ -147,21 +131,6 @@ function dispatcherField(src: string): string | null {
   const forEach = src.match(/this\.(\w+)\.forEach\(/);
   if (forEach) return forEach[1]!;
   return null;
-}
-
-const FN_KINDS = new Set(['method', 'function', 'component']);
-
-/** Innermost function/method node whose line range contains `line`. */
-function enclosingFn(nodesInFile: Node[], line: number): Node | null {
-  let best: Node | null = null;
-  for (const n of nodesInFile) {
-    if (!FN_KINDS.has(n.kind)) continue;
-    const end = n.endLine ?? n.startLine;
-    if (n.startLine <= line && end >= line) {
-      if (!best || n.startLine >= best.startLine) best = n; // prefer the tightest (latest-starting) encloser
-    }
-  }
-  return best;
 }
 
 /**
@@ -200,7 +169,7 @@ async function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext, 
       (d) => d.node.filePath === reg.node.filePath && d.field === reg.field
     );
     if (chDispatchers.length === 0) continue;
-    const argRe = new RegExp(`${reg.node.name}\\s*\\(\\s*(?:this\\.)?(\\w+)`);
+    const argRe = new RegExp(`${reg.node.name}\\s*\\(\\s*(this\\.\\w+|\\w+)\\s*(?=[,)])`);
     let added = 0;
     for (const e of queries.getIncomingEdges(reg.node.id, ['calls'])) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
@@ -210,8 +179,15 @@ async function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext, 
       const line = ctx.readFile(caller.filePath)?.split('\n')[e.line - 1];
       const am = line?.match(argRe);
       if (!am) continue;
-      const fn = ctx.getNodesByName(am[1]!).find((n) => n.kind === 'method' || n.kind === 'function');
-      if (!fn) continue;
+      // Reuse the resolved value at this registration site: it retains the
+      // receiver's class/inheritance and import binding, unlike a name lookup.
+      const refs = queries.getOutgoingEdges(caller.id, ['references']).filter(
+        (r) => r.line === e.line && r.metadata?.fnRef === true && r.metadata.refName === am[1]
+      );
+      if (refs.length !== 1) continue;
+      const fn = queries.getNodeById(refs[0]!.target);
+      if (!fn || (fn.kind !== 'method' && fn.kind !== 'function')) continue;
+      if (!am[1]!.startsWith('this.') && fn.filePath !== caller.filePath && refs[0]!.metadata?.resolvedBy !== 'import') continue;
       for (const disp of chDispatchers) {
         if (disp.node.id === fn.id) continue;
         const key = `${disp.node.id}>${fn.id}`;
@@ -913,9 +889,10 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
  *
  * Go guarantees a method's receiver type is declared in the SAME PACKAGE as the
  * method, and a Go package is a single directory — so this is a deterministic
- * structural link, not a heuristic: find the same-named type in the method's own
- * directory and add the missing `contains` edge (no `provenance: 'heuristic'`,
- * matching the same-file edges extraction already emits). Skips methods that
+ * structural link, not a heuristic: find the same-named type in the method's
+ * own directory and add the missing `contains` edge with no provenance, matching
+ * same-file extraction. Tag synthesis ownership so an incremental
+ * refresh can replace it alongside implicit `implements`. Skips methods that
  * already have a type parent (the same-file case). (#583, cross-file half)
  */
 async function goCrossFileMethodContainsEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
@@ -964,7 +941,8 @@ async function goCrossFileMethodContainsEdges(queries: QueryBuilder, onYield: Ma
     const key = `${owner.id}>${method.id}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    edges.push({ source: owner.id, target: method.id, kind: 'contains', line: method.startLine });
+    edges.push({ source: owner.id, target: method.id, kind: 'contains', line: method.startLine,
+      metadata: { synthesizedBy: 'go-method-contains' } });
   }
   return edges;
 }
@@ -1221,6 +1199,65 @@ async function goGrpcStubImplEdges(queries: QueryBuilder, onYield: MaybeYield): 
   return edges;
 }
 
+/** Kinds a JSX tag can name. A tag that resolves only to a type is markup we drop. */
+const JSX_CHILD_KINDS = new Set<NodeKind>(['component', 'function', 'class']);
+
+/**
+ * The languages a JSX tag can plausibly name a component in. Preferred over a
+ * same-named symbol in another language, never required — a React Native tag
+ * whose only match is the native class it bridges to (`requireNativeComponent`)
+ * still links there.
+ */
+const JSX_CHILD_LANGUAGES = [...JS_FAMILY, 'vue', 'svelte'];
+
+/** `localName` → the project file it is imported from, for one file's imports. */
+function importedFrom(ctx: ResolutionContext, file: string, language: Language): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const im of ctx.getImportMappings(file, language)) {
+    // The mappings name the module as written; the file it is comes from the
+    // same resolution the import resolver uses (aliases, extensions, index files).
+    const resolved = im.resolvedPath ?? resolveImportPath(im.source, file, language, ctx);
+    if (resolved) out.set(im.localName, resolved);
+  }
+  return out;
+}
+
+/**
+ * The component a JSX tag names, among every node that shares the name.
+ *
+ * A tag is written in one file, and that file already says which `FrameCard` it
+ * means: the one it declares, or the one it imports. Taking the FIRST node of
+ * that name — which is what this did — is a coin flip once a name repeats, and
+ * it costs twice over. The parent gets an edge to a component it never renders,
+ * and the component it does render is left with no caller at all, so every walk
+ * back from that subtree dead-ends: on an Expo app whose `<FrameCard/>` was one
+ * of two, the folder sheet's `openBackgroundNoiseDetail` stood alone on Screens
+ * with no screen behind it, while the edge pointed at an unrelated card in
+ * another sheet.
+ *
+ * Same file first — a small component declared beside its use is the commonest
+ * shape, and the one an import can never disambiguate. Then the file the name
+ * is imported from. Then the language, which only decides a tie: a `.tsx` tag
+ * naming both a TS component and a same-named Swift class means the TS one.
+ */
+function jsxChild(
+  ctx: ResolutionContext,
+  name: string,
+  file: string,
+  importsOf: () => Map<string, string>
+): Node | undefined {
+  const candidates = ctx.getNodesByName(name).filter((n) => JSX_CHILD_KINDS.has(n.kind));
+  if (candidates.length <= 1) return candidates[0];
+  const local = candidates.find((n) => n.filePath === file);
+  if (local) return local;
+  const from = importsOf().get(name);
+  if (from) {
+    const imported = candidates.find((n) => n.filePath === from);
+    if (imported) return imported;
+  }
+  return candidates.find((n) => JSX_CHILD_LANGUAGES.includes(n.language)) ?? candidates[0];
+}
+
 /**
  * Phase 5: React JSX child rendering. A component that returns `<Child .../>`
  * mounts Child — React calls it — but JSX instantiation isn't a static call edge,
@@ -1247,6 +1284,10 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
       (n) => PARENT_KINDS.has(n.kind) && JS_FAMILY.includes(n.language)
     );
     if (parents.length === 0) continue;
+    // Read once per file, and only when a name actually turns out ambiguous.
+    let imports: Map<string, string> | null = null;
+    const importsOf = () =>
+      (imports ??= importedFrom(ctx, file, parents[0]!.language));
     for (const parent of parents) {
       const src = sliceLines(content, parent.startLine, parent.endLine);
       if (!src || (!src.includes('</') && !src.includes('/>'))) continue;
@@ -1257,10 +1298,8 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
       let added = 0;
       for (const name of names) {
         if (added >= MAX_JSX_CHILDREN) break;
-        const child = ctx.getNodesByName(name).find(
-          (n) => n.kind === 'component' || n.kind === 'function' || n.kind === 'class'
-        );
-        if (!child || child.id === parent.id) continue;
+        const child = jsxChild(ctx, name, file, importsOf);
+        if (!child || child.id === parent.id || crossesCodeBoundary(parent.language, child.language)) continue;
         const key = `${parent.id}>${child.id}`;
         if (seen.has(key)) continue;
         seen.add(key);
@@ -1335,7 +1374,8 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
 
     let added = 0;
     const addEdge = (target: Node | undefined, meta: Record<string, unknown>) => {
-      if (added >= MAX_JSX_CHILDREN || !target || target.id === comp.id) return;
+      if (added >= MAX_JSX_CHILDREN || !target || target.id === comp.id ||
+          crossesCodeBoundary(comp.language, target.language)) return;
       const k = `${comp.id}>${target.id}>${meta.synthesizedBy}`;
       if (seen.has(k)) return;
       seen.add(k);
@@ -1405,10 +1445,13 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
  *     DeviceEventEmitter.addListener("locationUpdate", handler);
  *
  * Synthesize: native dispatch site → JS handler, keyed by the literal
- * event name. Only matches NAMED handlers (the existing `ON_RE` named-
- * capture form). Inline arrow handlers like `addListener('x', d => …)`
- * aren't named at extraction time and would need link-through-body
- * support; matches the deliberate scope of the in-language synthesizer.
+ * event name. A NAMED handler (`addListener('x', handleX)`) is the target
+ * when it is a node; an unnamed one — a parameter passed through, or an
+ * inline `(data) => {…}` written in a `useEffect` — is attributed to the
+ * enclosing function, where the event demonstrably lands. (The in-language
+ * synthesizer stays named-only; this channel pairs across a language
+ * boundary on a literal, which is the evidence that makes the wider
+ * attribution safe.)
  *
  * Provenance `'heuristic'`, synthesizedBy `'rn-event-channel'`.
  */
@@ -1517,6 +1560,9 @@ async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promis
       // function (the abstraction layer), giving a reachability-correct
       // hop even when the actual user-side handler lives one call up.
       const ADDLISTENER_ANY = /\.(?:on|once|addListener)\(\s*['"]([^'"]+)['"]\s*,\s*([A-Za-z_][\w.]*)/g;
+      // The inline form: `.addListener('x', (data) => {…})` / `function () {…}`.
+      const ADDLISTENER_INLINE =
+        /\.(?:on|once|addListener)\(\s*['"]([^'"]+)['"]\s*,\s*(?:async\s*)?(?:\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>|function\s*\()/g;
       ADDLISTENER_ANY.lastIndex = 0;
       let m: RegExpExecArray | null;
       while ((m = ADDLISTENER_ANY.exec(content))) {
@@ -1558,6 +1604,23 @@ async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promis
         if (!targetId) continue;
         const map = jsHandlersByEvent.get(event) ?? new Map<string, string>();
         map.set(targetId, `${file}:${lineOf(m.index)}`);
+        jsHandlersByEvent.set(event, map);
+      }
+      // Inline listeners — the shape a React component registers inside a
+      // `useEffect`: `nativeEmitter.addListener('onCaptureComplete', (data) =>
+      // { … router.push('/review') })`. There is no handler symbol to name,
+      // so the subscription is attributed to the enclosing function exactly
+      // as the unnamed-argument form above is: the native event lands in that
+      // component, and its body is where a reader looks next. This channel
+      // only — the in-language synthesizer keeps its named-handler policy.
+      ADDLISTENER_INLINE.lastIndex = 0;
+      while ((m = ADDLISTENER_INLINE.exec(content))) {
+        const event = m[1];
+        if (!event) continue;
+        const enclosing = enclosingFn(nodesInFile, lineOf(m.index));
+        if (!enclosing) continue;
+        const map = jsHandlersByEvent.get(event) ?? new Map<string, string>();
+        if (!map.has(enclosing.id)) map.set(enclosing.id, `${file}:${lineOf(m.index)}`);
         jsHandlersByEvent.set(event, map);
       }
     }
@@ -2065,11 +2128,16 @@ async function svelteKitLoadEdges(ctx: ResolutionContext, onYield: MaybeYield): 
       const loaderFile = `${dir}${prefix}${ext}`;
       if (!allFiles.has(loaderFile)) continue;
       for (const hook of ctx.getNodesInFile(loaderFile)) {
-        if (!HOOK_KINDS.has(hook.kind) || !HOOKS.has(hook.name)) continue;
+        // `load` and `actions` by name, and every function the loader file
+        // declares — a form action is an arrow inside `actions`, and it is a
+        // node of its own (`default`, `logout`), where the redirect that ends
+        // the submission is actually written.
+        const named = HOOK_KINDS.has(hook.kind) && HOOKS.has(hook.name);
+        if (!named && hook.kind !== 'function' && hook.kind !== 'method') continue;
         edges.push({
           source: page.id,
           target: hook.id,
-          kind: 'references',
+          kind: 'calls',
           line: page.startLine,
           provenance: 'heuristic',
           metadata: {
@@ -3143,7 +3211,7 @@ async function nixOptionPathEdges(queries: QueryBuilder, onYield: MaybeYield): P
   // own namespace (`attrsOf (submodule { options = ...; })`) — its internals
   // are not globally addressable, so the sentinel blocks registration below it
   // while still excluding the region from write candidates.
-  const SUBMODULE = ' submodule';
+  const SUBMODULE = '\u0000submodule';
   const decls = new Map<string, Rec[]>();
   const writes: Rec[] = [];
   const register = (path: string[], rec: Rec) => {
@@ -3518,8 +3586,6 @@ async function laravelEventEdges(ctx: ResolutionContext, onYield: MaybeYield): P
  * pre/post marks) so adding a pass without bumping this fails loudly instead
  * of silently skewing the bar.
  */
-const JS_FAMILY = ['typescript', 'javascript', 'tsx', 'jsx'];
-
 /** `has(...)` shape passed to pass gates — true when the project contains any of the languages. */
 type HasLang = (...ls: string[]) => boolean;
 
@@ -3544,6 +3610,36 @@ export interface SynthPassDef {
 
 const ALWAYS = (): boolean => true;
 
+/** Conservative input gates for SYNTH_PASSES; keep these in sync when adding a pass. */
+export function hasSynthesisPattern(filePath: string, content: string): boolean {
+  // These passes consume declarations/layouts as well as dispatch sites. A
+  // header or markup edit can change a channel whose endpoints live elsewhere.
+  if (/\.(?:vue|svelte|dfm|fmx|nix|xml)$/.test(filePath)) return true;
+  if (/\.(?:c|h|cc|cpp|cxx|hpp|hh|hxx|cppm|ipp|inl|tcc|def|inc|tbl)$/i.test(filePath) &&
+    /\b(?:struct|union|typedef|virtual|override)\b|#\s*(?:include|define|if)|=|->|\[/.test(content)) return true;
+  if (/\b(?:class|interface|protocol|trait|impl|extends|implements|expect|actual)\b/.test(content)) return true;
+  if (/\.go$/.test(filePath) && /\b(?:struct|interface)\b|\bfunc\s*\(/.test(content)) return true;
+  if (hasCrossTierPattern(content)) return true;
+  if (/\b(?:render|build|setState|defineStore|createStore|createApi|Store|href|sendEvent|sendEventWithName)\b|<\/|\/>/.test(content)) return true;
+  if (/\.(?:forEach|append|add|push|insert|fire|dispatchEvent|addListener|Use|GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|Any|Handle)\s*\(/.test(content)) return true;
+  if (/[\w$]\s*\[\s*[A-Za-z_$]/.test(content) || /\b(?:dispatch|commit)\s*\(/.test(content)) return true;
+  const patterns = [THUNK_DECL_RE, CELERY_TASK_DECORATOR_RE, CELERY_DISPATCH_RE,
+    SPRING_LISTENER_ANNO_RE, SPRING_APP_LISTENER_RE, SPRING_PUBLISH_RE,
+    MEDIATR_HANDLER_BASE_RE, MEDIATR_DISPATCH_RE, SIDEKIQ_WORKER_RE, SIDEKIQ_DISPATCH_RE,
+    ERLANG_CALLBACK_DECL_RE, ERLANG_DISPATCH_RE, LARAVEL_DISPATCH_RE, ARKUI_EMITTER_CALL_RE,
+    ARKUI_ROUTER_RE];
+  for (const re of patterns) {
+    re.lastIndex = 0;
+    const matches = re.test(content);
+    re.lastIndex = 0;
+    if (matches) return true;
+  }
+  // Field-backed observers use method-name gates rather than fixed call names.
+  return (content.match(/[A-Za-z_$][\w$]*/g) ?? []).some(
+    (name) => REGISTRAR_NAME.test(name) || DISPATCHER_NAME.test(name)
+  );
+}
+
 /**
  * The independent passes, in MERGE ORDER — the first-seen dedup in
  * synthesizeCallbackEdges follows this array, so reordering entries changes
@@ -3554,6 +3650,11 @@ const ALWAYS = (): boolean => true;
 export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'fieldEdges', gate: ALWAYS, run: (q, c, y) => fieldChannelEdges(q, c, y) },
   { name: 'closureCollEdges', gate: ALWAYS, run: (q, c, y) => closureCollectionEdges(q, c, y) },
+  // Cross-tier channels — a client's `fetch('/api/x')` onto its own route,
+  // a queue job onto its consumer, a bus / socket event onto its handler.
+  // Before the in-process emitter pass: the same (source, target) pair
+  // keeps the more specific edge — the one that says which tier it crosses.
+  { name: 'tierEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => crossTierEdges(c, y) },
   { name: 'emitterEdges', gate: ALWAYS, run: (_q, c, y) => eventEmitterEdges(c, y) },
   { name: 'renderEdges', gate: ALWAYS, run: (q, c, y) => reactRenderEdges(q, c, y) },
   { name: 'jsxEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => reactJsxChildEdges(c, y) },
@@ -3610,6 +3711,15 @@ export const SYNTH_PASSES: SynthPassDef[] = [
     run: (q, c, y, sub) => cFnPointerDispatchEdges(q, c, y, sub),
   },
   { name: 'goframeEdges', gate: (has) => has('go'), run: (_q, c, y) => goframeRouteEdges(c, y) },
+  // `router.push(await helper())` — the helper's return literals are the screens.
+  { name: 'expoRouterReturnEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => expoRouterReturnEdges(c, y) },
+  // `<Link href="/x">` / an internal `<a href>` — markup, not a call; the component navigates.
+  { name: 'nextLinkEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => nextLinkEdges(c, y) },
+  { name: 'reactRouterLinkEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => reactRouterLinkEdges(c, y) },
+  { name: 'tanstackLinkEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => tanstackLinkEdges(c, y) },
+  { name: 'vueRouterLinkEdges', gate: (has) => has('vue', ...JS_FAMILY), run: (_q, c, y) => vueRouterLinkEdges(c, y) },
+  { name: 'svelteKitPageEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitPageComponentEdges(c, y) },
+  { name: 'svelteKitLinkEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitLinkEdges(c, y) },
   { name: 'nixOptionEdges', gate: (has) => has('nix'), run: (q, _c, y) => nixOptionPathEdges(q, y) },
 ];
 
@@ -3805,6 +3915,15 @@ export async function synthesizeCallbackEdges(
     await yieldToLoop();
     await foldIfOver();
   }
+  // Remember source gates, including inputs that currently produce NO edges
+  // (e.g. an over-cap channel). Deleting one may make the full pass viable.
+  const inputs: string[] = [];
+  for (const file of ctx.getAllFiles()) {
+    const content = ctx.readFile(file);
+    if (content !== null && hasSynthesisPattern(file, content)) inputs.push(file);
+    await yieldToLoop();
+  }
+  queries.replaceSynthesisInputs(inputs);
   __mark('insertMergedEdges');
   return merged.length + goImpl.length + goMethodContains.length;
 }

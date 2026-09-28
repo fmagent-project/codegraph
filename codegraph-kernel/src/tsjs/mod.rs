@@ -55,15 +55,34 @@ impl Variant {
 /// typescriptExtractor.methodTypes / javascriptExtractor.methodTypes.
 fn is_method_type(v: Variant, kind: &str) -> bool {
     kind == "method_definition"
-        || (v.is_ts() && kind == "public_field_definition")
+        || (v.is_ts() && matches!(kind, "public_field_definition" | "method_signature"))
         || (!v.is_ts() && kind == "field_definition")
 }
 
+/// typescriptExtractor.propertyTypes. The interface counterpart of
+/// `public_field_definition`: it carries no value, so it is always a property
+/// and never goes through classify_ts_class_member (#1638).
+fn is_property_type(v: Variant, kind: &str) -> bool {
+    v.is_ts() && kind == "property_signature"
+}
+
+/// Method node types that spell a SIGNATURE — a declaration with no body (#1638).
+///
+/// They are a method of whatever type declares them and nothing on their own, so
+/// they must not take `extract_method`'s "no class-like parent, so treat it as a
+/// free function" fallback. The other method types can: a `method_definition`
+/// outside a class really is a function. This one appears outside a class only
+/// inside a type literal (`type Handle = { stop(): void }`), whose members
+/// `extract_ts_type_alias_members` already extracts and attaches to the alias
+/// (#359) — take the fallback and the file gains a phantom top-level
+/// `function stop` beside the real `Handle::stop`. Mirrors the TS extractor's
+/// SIGNATURE_METHOD_NODE_TYPES (extraction/tree-sitter.ts).
+fn is_signature_method_type(kind: &str) -> bool {
+    kind == "method_signature"
+}
+
 fn is_function_type(kind: &str) -> bool {
-    matches!(
-        kind,
-        "function_declaration" | "generator_function" | "arrow_function" | "function_expression"
-    )
+    matches!(kind, "function_declaration" | "generator_function_declaration" | "arrow_function" | "function_expression" | "generator_function")
 }
 
 fn is_class_type(v: Variant, kind: &str) -> bool {
@@ -148,6 +167,7 @@ pub struct Walker<'t> {
     variant: Variant,
     line_starts: Vec<usize>,
     arena: Arena,
+    node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
     stack: Vec<Scope>,
     /// Node id string per row. Rows are unique but IDS COLLIDE for same
@@ -203,6 +223,7 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
         variant,
         line_starts: util::line_starts(source),
         arena: Arena::default(),
+        node_id_allocator: ids::NodeIdAllocator::default(),
         tables: Tables::default(),
         stack: Vec::new(),
         node_ids: Vec::new(),
@@ -329,7 +350,8 @@ impl<'t> Walker<'t> {
             return None;
         }
         let start_line = self.line_of(node);
-        let id = ids::node_id(self.file_path, kind, name, start_line);
+        let column = self.col_of(node);
+        let id = self.node_id_allocator.generate(self.file_path, kind, name, start_line, column);
 
         // endLine body extension: resolveBody only (TS/JS: function-valued
         // class fields whose body nests in the arrow / HOF-wrapped arrow).
@@ -625,7 +647,9 @@ impl<'t> Walker<'t> {
         } else if is_class_type(self.variant, kind) {
             self.extract_class(node);
             skip_children = true;
-        } else if is_method_type(self.variant, kind) {
+        } else if is_method_type(self.variant, kind)
+            && (!is_signature_method_type(kind) || self.inside_class_like())
+        {
             if classify_ts_class_member(node) == Member::Property {
                 let prop = self.extract_property(node);
                 if let (Some((row, name)), Some(value)) = (prop, node.child_by_field_name("value")) {
@@ -667,12 +691,22 @@ impl<'t> Walker<'t> {
             self.extract_call(node);
         } else if kind == "new_expression" {
             self.extract_instantiation(node);
-        } else if self.variant.is_ts()
-            && matches!(kind, "property_signature" | "method_signature")
-            && self.inside_class_like()
-        {
-            let parent = self.top_row();
-            self.extract_type_annotations(node, parent);
+        } else if is_property_type(self.variant, kind) && self.inside_class_like() {
+            // NOTE: `property_signature` / `method_signature` used to be handled
+            // here together, hanging their type annotations off the ENCLOSING
+            // INTERFACE — the only anchor available while the members themselves
+            // went unextracted. Since #1638 `method_signature` is a method type
+            // and `property_signature` a property type, so the method branch
+            // above claims the first (under the same inside_class_like guard
+            // this branch had) and this one extracts the second as a real node.
+            // The `references` edges survive — extract_method and
+            // extract_property each call extract_type_annotations — but now hang
+            // off the member, the more precise anchor: `Api::fetch → PageId`
+            // says which member wants the type, where `Api → PageId` only said
+            // the file did.
+            self.extract_property(node);
+            self.scan_fn_ref_subtree(node, 0);
+            skip_children = true;
         }
 
         if !skip_children {
@@ -707,12 +741,34 @@ impl<'t> Walker<'t> {
             self.extract_variable_type_annotation(node, owner);
         }
 
-        // Nested named functions become their own nodes. String-named wrappers
-        // such as `Effect.fn("Session.run")(function* () {})` provide an
-        // explicit name for an otherwise anonymous function expression.
+        // Nested NAMED functions become their own nodes. So do two kinds of
+        // otherwise-anonymous function that something else names for them: the
+        // function a React handler hook binds a name to (`const onPress =
+        // useCallback(() => {…}, [])`, upstream — mirrors TreeSitterExtractor's
+        // reactHookBoundName) and one a string-named wrapper names
+        // (`Effect.fn("Session.run")(function* () {…})`, fork patch — see
+        // wrapped_function_name).
         if is_function_type(kind) {
             let name = self.extract_name(node);
             if name != "<anonymous>" || self.wrapped_function_name(node).is_some() {
+                self.extract_function(node, None);
+                return;
+            }
+            if let Some(bound) = self.react_hook_bound_name(node) {
+                self.extract_function(node, Some(bound));
+                return;
+            }
+            // `const run = Effect.fn("Session.run")(function* () {…})` (#1747):
+            // the same declarator binding through a curried wrapper. Mirrors
+            // TreeSitterExtractor's curriedWrapperBoundName.
+            if let Some(bound) = self.curried_wrapper_bound_name(node) {
+                self.extract_function(node, Some(bound));
+                return;
+            }
+            // `const handleClear = () => {…}` inside a body (#1669): named by
+            // its declarator, like at module scope. Mirrors
+            // TreeSitterExtractor's declaratorBoundFunction.
+            if self.declarator_bound_function(node) {
                 self.extract_function(node, None);
                 return;
             }
@@ -740,6 +796,130 @@ impl<'t> Walker<'t> {
 
     // --- name / signature / modifier helpers ------------------------------------
 
+    /// Whether an anonymous function is the whole value of a
+    /// `variable_declarator` with a plain identifier name —
+    /// `const NAME = () => {…}` / `= function () {…}`.
+    fn declarator_bound_function(&self, node: Node<'t>) -> bool {
+        if !matches!(node.kind(), "arrow_function" | "function_expression") {
+            return false;
+        }
+        let Some(declarator) = node.parent() else { return false };
+        if declarator.kind() != "variable_declarator" {
+            return false;
+        }
+        let Some(value) = declarator.child_by_field_name("value") else { return false };
+        if value.start_byte() != node.start_byte() || value.end_byte() != node.end_byte() {
+            return false;
+        }
+        declarator
+            .child_by_field_name("name")
+            .map(|n| n.kind() == "identifier")
+            .unwrap_or(false)
+    }
+
+    /// The declarator name a React handler hook binds an anonymous function
+    /// to — `const NAME = useCallback(<node>, [...])` (also `React.useCallback`,
+    /// `useEffectEvent`, `useEvent`) — or None for any other shape. The node
+    /// must be the call's FIRST argument and the call's value must be bound
+    /// directly by a `variable_declarator`.
+    fn react_hook_bound_name(&self, node: Node<'t>) -> Option<String> {
+        if !matches!(node.kind(), "arrow_function" | "function_expression") {
+            return None;
+        }
+        let args = node.parent()?;
+        if args.kind() != "arguments" {
+            return None;
+        }
+        let first = args.named_child(0)?;
+        if first.start_byte() != node.start_byte() || first.end_byte() != node.end_byte() {
+            return None;
+        }
+        let call = args.parent()?;
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        let callee = call.child_by_field_name("function")?;
+        let callee_text = self.text(callee);
+        let hook = callee_text.strip_prefix("React.").unwrap_or(callee_text);
+        if !matches!(hook, "useCallback" | "useEffectEvent" | "useEvent") {
+            return None;
+        }
+        let declarator = call.parent()?;
+        if declarator.kind() != "variable_declarator" {
+            return None;
+        }
+        let name_node = declarator.child_by_field_name("name")?;
+        if name_node.kind() != "identifier" {
+            return None;
+        }
+        Some(self.text(name_node).to_string())
+    }
+
+    /// The declarator name for an anonymous function passed to a CURRIED
+    /// wrapper call — `const NAME = factory(...)(function () {…})` — or the
+    /// property key when the call is an object member, `{ NAME: factory(...)(fn) }`;
+    /// else None.
+    ///
+    /// `react_hook_bound_name` above names a function through the declarator
+    /// that binds it; the shape is general, but that method is bounded to the
+    /// three React handler hooks. This is the same shape with a different,
+    /// equally decidable bound: the callee is itself a call, i.e. a factory
+    /// that returns the wrapper (#1747). Requiring that keeps it narrow —
+    /// `useMemo(|| …, [])` and `arr.map(…)` are single calls and stay
+    /// anonymous, exactly as before.
+    ///
+    /// Generators are admitted here and not in `react_hook_bound_name`: a
+    /// React handler is never a generator, while `function*` is the common
+    /// form in the ecosystem this shape comes from.
+    ///
+    /// Mirrors TreeSitterExtractor's curriedWrapperBoundName.
+    fn curried_wrapper_bound_name(&self, node: Node<'t>) -> Option<String> {
+        if !matches!(
+            node.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        ) {
+            return None;
+        }
+        let args = node.parent()?;
+        if args.kind() != "arguments" {
+            return None;
+        }
+        let first = args.named_child(0)?;
+        if first.start_byte() != node.start_byte() || first.end_byte() != node.end_byte() {
+            return None;
+        }
+        let call = args.parent()?;
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        // The bound that replaces the hook allowlist: the thing being called
+        // is itself a call, so this is a curried wrapper's second application.
+        let callee = call.child_by_field_name("function")?;
+        if callee.kind() != "call_expression" {
+            return None;
+        }
+        let binder = call.parent()?;
+        // `{ getMode: Effect.fn("…")(function* () {…}) }`: an object member is
+        // named by its property key, as extract_object_literal_functions names
+        // `key: () => {}`.
+        if binder.kind() == "pair" {
+            let key = binder.child_by_field_name("key")?;
+            let value = binder.child_by_field_name("value")?;
+            if value.start_byte() != call.start_byte() || value.end_byte() != call.end_byte() {
+                return None;
+            }
+            return Some(util::object_key_name(self.text(key)));
+        }
+        if binder.kind() != "variable_declarator" {
+            return None;
+        }
+        let name_node = binder.child_by_field_name("name")?;
+        if name_node.kind() != "identifier" {
+            return None;
+        }
+        Some(self.text(name_node).to_string())
+    }
+
     /// extractName / extractNameRaw for the TS/JS configs.
     fn extract_name(&self, node: Node) -> String {
         // javascriptExtractor.resolveName: field_definition names its key the
@@ -752,10 +932,7 @@ impl<'t> Walker<'t> {
         if let Some(name_node) = node.child_by_field_name("name") {
             return self.text(name_node).to_string();
         }
-        if matches!(
-            node.kind(),
-            "arrow_function" | "function_expression" | "generator_function"
-        ) {
+        if matches!(node.kind(), "arrow_function" | "function_expression" | "generator_function") {
             return "<anonymous>".to_string();
         }
         for i in 0..node.named_child_count() {

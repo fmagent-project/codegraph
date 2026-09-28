@@ -5,7 +5,8 @@
  * SAME ExtractionResult as the wasm TreeSitterExtractor — nodes, edges, and
  * unresolved refs compared as canonicalized multisets — over the checked-in
  * torture fixture (torture.rs: impl/trait quirks incl. generic / lifetime /
- * reference / scoped / generic-trait impl receivers (#1588), unit-struct skip, phantom
+ * reference / scoped / generic-trait impl receivers (#1588), unit structs
+ * (a bodiless struct IS a definition — both walkers mint a node), phantom
  * const identifiers, use-binding refs incl. nested groups + wildcard-emits-
  * nothing, chained-call re-encode, turbofish, Rocket route macros body-only,
  * fn-ref shapes, value-ref shadowing, attribute-broken docstrings, dead-code
@@ -89,6 +90,28 @@ describe.skipIf(!kernelBuilt)('kernel Rust extraction parity', () => {
     expect(k.refs, `${filePath}: refs`).toEqual(w.refs);
     expect(viaWasm.nodes.length).toBeGreaterThanOrEqual(minNodes);
   }
+
+  it('preserves Tauri command attributes without treating comments or strings as registrations', () => {
+    const source = `
+#[tauri::command]
+fn port() -> u16 { 4000 }
+#[tauri :: command(rename_all = "snake_case")]
+/* between attributes */
+#[allow(dead_code)]
+pub async fn settings() {}
+// #[tauri::command]
+fn ordinary() {}
+const TEXT: &str = r#"#[tauri::command]"#;
+fn after_string() {}
+#[other::command]
+fn unrelated() {}
+#[tauri::command]
+fn outer() { fn inner() {} }
+fn next() {}
+`;
+    assertParity('commands.rs', source);
+    assertParity('commands.rs', source.replace(/\n/g, '\r\n'));
+  });
 
   it('torture fixture: impl/trait quirks, use bindings, chains, fn-refs, value-refs, route macros', () => {
     const file = path.join(FIXTURE_DIR, 'torture.rs');
