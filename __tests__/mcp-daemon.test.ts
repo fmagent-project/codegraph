@@ -43,6 +43,7 @@ import { getDaemonSocketPath } from '../src/mcp/daemon-paths';
 import { CodeGraphPackageVersion } from '../src/mcp/version';
 import { once } from 'events';
 import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
+import { recordSpawns, removeSpawnLog, settleLosingCandidates } from './daemon-candidates';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
@@ -53,13 +54,15 @@ interface SpawnedServer {
 }
 
 function spawnServer(cwd: string, env: NodeJS.ProcessEnv = {}, args: string[] = []): SpawnedServer {
-  const child = spawn(process.execPath, [...WASM_RUNTIME_FLAGS, BIN, 'serve', '--mcp', ...args], {
+  // Record the daemon candidates this launcher spawns, for the teardown.
+  const recorder = recordSpawns(cwd);
+  const child = spawn(process.execPath, [...WASM_RUNTIME_FLAGS, ...recorder.args, BIN, 'serve', '--mcp', ...args], {
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
     // #618: the daemon-attach log line is now off by default; opt the test
     // harness into it (CODEGRAPH_MCP_LOG_ATTACH=1) so the attach assertions
     // below can still observe a successful attach. A per-test env still wins.
-    env: { CODEGRAPH_MCP_LOG_ATTACH: '1', ...process.env, ...env },
+    env: { CODEGRAPH_MCP_LOG_ATTACH: '1', ...process.env, ...recorder.env, ...env },
   }) as ChildProcessWithoutNullStreams;
   // Swallow spawn/EPIPE errors so killing a child mid-write can't surface as an
   // unhandled error that crashes the vitest worker.
@@ -205,6 +208,10 @@ describe('Shared MCP daemon (issue #411)', () => {
       child.kill('SIGKILL');
       await exited;
     }));
+    // Racing launchers may each have spawned a daemon candidate, and a loser
+    // can still be starting on a loaded machine. Stopping the winner first
+    // would let it take over the fixture being removed (#1773).
+    await settleLosingCandidates(tempDir, () => readLockPid(realRoot));
     // The daemon is detached (not a tracked child) — reap it explicitly via the
     // pid it recorded, so a test can't leak a background daemon. Guard against
     // our own pid: the version-mismatch test plants `pid: process.pid` in the
@@ -216,14 +223,18 @@ describe('Shared MCP daemon (issue #411)', () => {
     }
     await new Promise((r) => setTimeout(r, 50));
     servers.length = 0;
+    removeSpawnLog(tempDir);
     await fs.promises.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-  });
+  }, 45_000);
 
   it.runIf(process.platform !== 'win32')('stops despite a socket still waiting for its client hello (#1963)', async () => {
     const server = spawnServer(tempDir);
     servers.push(server);
     sendInitialize(server.child, `file://${tempDir}`, 1);
     await waitFor(() => findResponse(server.stdout, 1), 10000);
+    // The lock is written before the socket is bound; an attached proxy proves
+    // the daemon is listening (#1773).
+    await waitFor(() => server.stderr.some((l) => l.includes('Attached to shared daemon')), 10000);
     const pid = await waitFor(() => readLockPid(realRoot), 10000);
     const raw = net.connect(getDaemonSocketPath(realRoot));
     try {
@@ -806,4 +817,142 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(resp.result !== undefined || resp.error !== undefined).toBe(true);
     expect(isAlive(server.child.pid!)).toBe(true);
   }, 45000);
+
+  it('a proxy serving in-process hands the writer lock back to a fresh daemon (#2277)', async () => {
+    // After its daemon dies, the proxy's in-process engine takes writer.pid in
+    // fallback mode. Every later daemon start used to fail on that lock for the
+    // rest of the session, so every other session on the project ran read-only
+    // without auto-sync. The degraded proxy now retries the daemon: it stops
+    // its engine (releasing the lock), lets a daemon start, and proxies again.
+    const env = {
+      CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '30000',
+      CODEGRAPH_PPID_POLL_MS: '5000',
+      // The default, spelled out: long enough to observe the lockout first.
+      CODEGRAPH_DAEMON_RETRY_MS: '5000',
+    };
+    const a = spawnServer(tempDir, env);
+    servers.push(a);
+    const proxyPid = a.child.pid!;
+    sendInitialize(a.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(a.stdout, 1), 20000, 25, 'initialize response');
+    await waitFor(() => a.stderr.some((l) => l.includes('Attached to shared daemon')), 8000, 25, 'first daemon attach');
+    sendMessage(a.child, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
+    await waitFor(() => findResponse(a.stdout, 2), 30000, 25, 'warm tools/call via daemon');
+    const firstDaemon = readLockPid(realRoot)!;
+
+    process.kill(firstDaemon, 'SIGTERM');
+    expect(await waitProcessExit(firstDaemon, 8000)).toBe(true);
+    await waitFor(() => a.stderr.some((l) => l.includes('serving this session in-process')), 8000, 25, 'in-process failover');
+    sendMessage(a.child, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
+    await waitFor(() => findResponse(a.stdout, 3), 15000, 25, 'in-process tools/call');
+
+    // The lockout: the in-process engine owns the project's writer slot.
+    expect(readWriterInfo(realRoot)).toMatchObject({ pid: proxyPid, mode: 'fallback' });
+
+    // Another session starting now cannot get a daemon while that lock is held.
+    const b = spawnServer(tempDir, env);
+    servers.push(b);
+    sendInitialize(b.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(b.stdout, 1), 20000, 25, 'second session initialize');
+
+    // Keep calling through the handover: every request gets exactly one reply.
+    let nextId = 4;
+    const send = (): void => {
+      sendMessage(a.child, { jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
+    };
+    const ticker = setInterval(send, 250);
+    let daemonWriter: { pid: number; mode: string } | null = null;
+    try {
+      daemonWriter = await waitFor(() => {
+        const w = readWriterInfo(realRoot);
+        return w && w.mode === 'daemon' && w.pid !== proxyPid && isAlive(w.pid) ? w : null;
+      }, 30000, 25, 'a daemon to own the writer lock');
+      await waitFor(
+        () => a.stderr.some((l) => l.includes(`Attached to shared daemon`) && l.includes(`(pid ${daemonWriter!.pid},`)),
+        15000, 25, 'the proxy to reattach to the new daemon',
+      );
+    } finally {
+      clearInterval(ticker);
+    }
+    send();
+    const lastId = nextId - 1;
+    await waitFor(() => findResponse(a.stdout, lastId), 15000, 25, 'a tools/call through the new daemon');
+    for (let id = 2; id <= lastId; id++) {
+      const replies = a.stdout.filter((line) => {
+        try { const m = JSON.parse(line); return m.id === id && ('result' in m || 'error' in m); } catch { return false; }
+      });
+      expect(replies, `replies to request ${id}`).toHaveLength(1);
+      expect(JSON.parse(replies[0]).error, `request ${id}`).toBeUndefined();
+    }
+    expect(readLockPid(realRoot)).toBe(daemonWriter!.pid);
+
+    // The session that started during the lockout ends up on the shared daemon too.
+    await waitFor(
+      () => b.stderr.some((l) => l.includes('Attached to shared daemon') && l.includes(`(pid ${daemonWriter!.pid},`)),
+      30000, 25, 'the second session to attach',
+    );
+    sendMessage(b.child, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
+    const bReply = await waitFor(() => findResponse(b.stdout, 2), 15000, 25, 'second session tools/call');
+    expect(bReply.error).toBeUndefined();
+  }, 90000);
+
+  it('a read-only in-process session moves to the shared daemon once one can start (#2277)', async () => {
+    // A session that fell back read-only (another daemon held the project)
+    // used to stay that way for life. Once the blocker is gone it now starts
+    // and attaches to a daemon of its own version.
+    const sockPath = getDaemonSocketPath(realRoot);
+    const pidPath = path.join(realRoot, '.codegraph', 'daemon.pid');
+    fs.writeFileSync(pidPath, JSON.stringify({ pid: process.pid, version: '0.0.0-mismatch', socketPath: sockPath, startedAt: Date.now() }));
+    const miniServer = net.createServer((sock) => {
+      sock.write(JSON.stringify({ codegraph: '0.0.0-mismatch', pid: process.pid, socketPath: sockPath, protocol: 1 }) + '\n');
+    });
+    await new Promise<void>((resolve) => miniServer.listen(sockPath, () => resolve()));
+    let miniServerOpen = true;
+    try {
+      const server = spawnServer(tempDir, {
+        CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '30000',
+        CODEGRAPH_DAEMON_RETRY_MS: '300',
+        CODEGRAPH_DAEMON_RETRY_MAX_MS: '1000',
+      });
+      servers.push(server);
+      sendInitialize(server.child, `file://${tempDir}`, 1);
+      await waitFor(() => server.stderr.some((l) => l.includes('serving this session in-process')), 10000, 25, 'in-process fallback');
+      sendMessage(server.child, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
+      const local = await waitFor(() => findResponse(server.stdout, 2), 10000, 25, 'read-only tools/call');
+      expect(local.error).toBeUndefined();
+      expect(server.stderr.some((l) => l.includes('Serving reads in-process without auto-sync'))).toBe(true);
+      // Retries while the other version still answers start no daemon.
+      await waitFor(
+        () => server.stderr.filter((l) => l.includes('differs from ours')).length >= 3,
+        10000, 25, 'repeated retries against the other version',
+      );
+      expect(countListeningLines(realRoot)).toBe(0);
+
+      // The other-version daemon goes away.
+      await new Promise<void>((resolve) => miniServer.close(() => resolve()));
+      miniServerOpen = false;
+      fs.rmSync(pidPath, { force: true });
+
+      const attached = await waitFor(
+        () => server.stderr.find((l) => l.includes('Attached to shared daemon')),
+        30000, 25, 'the session to attach to a daemon',
+      );
+      const daemonPid = readLockPid(realRoot)!;
+      expect(attached).toContain(`(pid ${daemonPid},`);
+      expect(readWriterInfo(realRoot)).toMatchObject({ pid: daemonPid, mode: 'daemon' });
+      sendMessage(server.child, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
+      const viaDaemon = await waitFor(() => findResponse(server.stdout, 3), 15000, 25, 'tools/call through the daemon');
+      expect(viaDaemon.error).toBeUndefined();
+      expect(JSON.stringify(viaDaemon.result)).toContain('CodeGraph Status');
+    } finally {
+      if (miniServerOpen) await new Promise<void>((resolve) => miniServer.close(() => resolve()));
+    }
+  }, 60000);
 });
+
+function readWriterInfo(root: string): { pid: number; mode: string } | null {
+  try {
+    const info = JSON.parse(fs.readFileSync(path.join(root, '.codegraph', 'writer.pid'), 'utf8'));
+    return typeof info.pid === 'number' && typeof info.mode === 'string' ? info : null;
+  } catch { return null; }
+}

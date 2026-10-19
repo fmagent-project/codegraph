@@ -3,9 +3,11 @@
 FM-Agent's maintenance fork of
 [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph).
 
-**Pinned base:** upstream `e63fe2e` (`main`, 2026-09-27) — an untagged commit, the
-exception the policy below allows: upstream has not tagged since `v1.6.0`, and the
-fixes this sync is for live only on `main`.
+**Pinned base:** upstream `10e316d` (`main`, 2026-10-19) — an untagged commit past
+`v1.6.2`, the exception the policy below allows. `v1.6.2` itself slows indexing of
+JavaScript and Python projects, fixed only on `main` (#2362, #2344), and the fixes
+this sync is for — C++ receiver types and overloads, Go interfaces and embedding,
+functions in named object literals (#2300) — are on `main` only.
 
 It carries this project's
 [PR #1865](https://github.com/colbymchenry/codegraph/pull/1865) for Dart 3
@@ -25,13 +27,12 @@ wrappers nothing binds, and calls into a service's members. Measured on
 `sst/opencode` (`df23b7f`) by source position, upstream alone reaches 1,017 of the
 1,055 `Effect.fn*("…")(function…)` sites; with patch 2, all 1,055.
 
-The previous base was `3ed73bc` (`main`, 2026-09-13), 93 commits behind this point
-(91 of them not merges). It had brought upstream's fixes for TS/JS generator
-functions ([#1741](https://github.com/colbymchenry/codegraph/issues/1741)) and C++
-pure virtual methods ([#1727](https://github.com/colbymchenry/codegraph/issues/1727)).
-Upstream's generator fix stops short in one place — the two helpers that read a
-class field's value still do not list `generator_function`, on either extraction
-path — so the part of the fork's patch covering that shape stays, as patch 4 below.
+The previous base was `e63fe2e` (`main`, 2026-09-27), 363 commits behind this point,
+none of them merges. None of the four patches below was taken upstream in that span:
+all four merged back without a conflict and are byte for byte what they were.
+Upstream's generator fix ([#1741](https://github.com/colbymchenry/codegraph/issues/1741))
+still stops short in one place — the two helpers that read a class field's value do
+not list `generator_function`, on either extraction path — so patch 4 stays.
 
 Upstream shipped the C macro-attribute extraction fix (issue #1211, PR #1311) in
 v1.5.0, so the base carries it natively; the fork no longer needs its own patch
@@ -64,21 +65,38 @@ tree or changing how the runner discovers it: our file would stay where it is, q
 stop being collected, and nothing would fail. Check the suite's file count after a
 sync, not just that it is green.
 
-**Version marker:** `codegraph --version` → `1.6.0-fmagent.N` identifies a build
+**Version marker:** `codegraph --version` → `1.6.2-fmagent.N` identifies a build
 from this fork. It lives in **two** files as of this base — the root `package.json`
 and `ui/package.json` — and `__tests__/ui-package.test.ts` asserts the two match.
 Upstream ships `scripts/sync-ui-version.mjs` for this, but it runs only from
 `build:lib`; neither `npm test` nor `npm run build` reaches it, so a version bump
 has to touch both files by hand or the suite goes red.
 
-Note this is a SemVer pre-release of `1.6.0`, so it sorts *below*
-plain `1.6.0`; the updater must therefore point at this fork (see below), never
+Note this is a SemVer pre-release of `1.6.2`, so it sorts *below*
+plain `1.6.2`; the updater must therefore point at this fork (see below), never
 upstream, or it would advertise a "downgrade to upstream" as an upgrade.
+
+Being a pre-release has one more effect, from upstream's #2335: a launcher stops a
+daemon left over from an *older* install, but `isOlderRelease` (`src/mcp/version.ts`)
+compares plain `X.Y.Z` releases only, so a fork build neither stops an older daemon
+nor is stopped by a newer one — it reports a version mismatch instead. Three
+end-to-end cases in `__tests__/daemon-older-version.test.ts` fail on a fork build for
+that reason (they pass on upstream); CI does not run them. FM-Agent runs `init` and
+`index` from the command line and starts no daemon, so it is unaffected.
 
 **All install/upgrade entry points point at this fork,** so a fork install never
 silently escapes back to upstream: `install.sh` / `install.ps1` (`REPO` / `$repo`)
 and the built-in updater (`src/upgrade/index.ts` `REPO`) all resolve releases and
-installers from `fmagent-project/codegraph`.
+installers from `fmagent-project/codegraph`. So does the reinstall command the
+Windows file swap prints when it cannot put files back (`Install-CodeGraphFiles` in
+`install.ps1`, and its copy `WINDOWS_SWAP_FUNCTION` in `src/upgrade/index.ts`, which
+a test keeps identical). `install.sh`'s hint for Windows shells still names
+upstream's `install.ps1`, as before: `__tests__/installer-targets.test.ts` pins it.
+
+**Verifying a sync:** besides `npm test`, run
+[`fmagent-project/codegraph-benchmark`](https://github.com/fmagent-project/codegraph-benchmark)
+(`make check`): one case per extraction bug FM-Agent has hit, upstream's and these
+patches', each of which fails on a build that lacks the fix.
 
 **Releases:** tagged `vX.Y.Z-fmagent.N`, each carrying self-contained per-OS
 bundles (darwin/linux/windows, arm64/x64) with the native Rust extraction

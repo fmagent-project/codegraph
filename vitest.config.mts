@@ -12,8 +12,12 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     include: ['__tests__/**/*.test.ts'],
-    // Suites that spawn the built CLI need a current dist/ (#1879).
-    globalSetup: ['./__tests__/global-setup-dist.ts'],
+    // Suites that spawn the built CLI need a current dist/ (#1879), and the end
+    // of the run removes any home sandbox its own test file could not.
+    globalSetup: ['./__tests__/global-setup-dist.ts', './__tests__/global-setup-home-sandbox.ts'],
+    // A throwaway home dir (and git global config) per test file, so nothing
+    // the suite runs can write to the developer's real one (#2275).
+    setupFiles: ['./__tests__/setup-home-sandbox.ts'],
     /**
      * Several MCP integration tests (mcp-daemon, mcp-initialize, mcp-ppid-watchdog,
      * mcp-roots) spawn `dist/bin/codegraph.js serve --mcp` with `process.execPath`

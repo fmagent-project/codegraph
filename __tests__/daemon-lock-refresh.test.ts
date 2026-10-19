@@ -2,8 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { spawn } from 'child_process';
-import { once } from 'events';
 import { refreshDaemonLock, type DaemonLockInfo } from '../src/mcp/daemon';
 
 vi.mock('fs', async (importOriginal) => {
@@ -51,7 +49,7 @@ describe('daemon ownership refresh under Windows sharing violations', () => {
     const error = denied('EPERM');
     vi.mocked(fs.renameSync).mockImplementation(() => { throw error; });
     expect(() => refreshDaemonLock(pidPath, initial, lock, 'win32')).toThrow(error);
-    expect(fs.renameSync).toHaveBeenCalledTimes(6);
+    expect(fs.renameSync).toHaveBeenCalledTimes(8);
     expect(fs.readFileSync(pidPath, 'utf8')).toBe(initial);
     noTemporaryFile();
   });
@@ -79,25 +77,33 @@ describe('daemon ownership refresh under Windows sharing violations', () => {
     },
   );
 
-  it.runIf(process.platform === 'win32')('waits for a real Windows handle denying delete sharing', async () => {
-    // Node opens files with delete sharing; a .NET handle lets us reproduce
-    // the real rename failure deterministically without mocking filesystem I/O.
-    const script = `$h = [IO.File]::Open('${pidPath.replace(/'/g, "''")}', 'Open', 'Read', 'Read'); `
-      + "[Console]::WriteLine('locked'); Start-Sleep -Milliseconds 200; $h.Dispose()";
-    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-      stdio: ['ignore', 'pipe', 'pipe'],
+  it.runIf(process.platform === 'win32')('waits for a real Windows handle on the pid file to close', () => {
+    // Windows will not replace a file while any handle to it is open, even
+    // one that shares delete access, which is how a scanner, an indexer or
+    // another process reading the lock trips this path. Hold a real handle,
+    // let the first real rename fail, and close it only then, so the retry
+    // follows the release by order rather than racing a timer against the
+    // backoff (#1773).
+    const handle = fs.openSync(pidPath, 'r');
+    const held: NodeJS.ErrnoException[] = [];
+    vi.mocked(fs.renameSync).mockImplementationOnce((from, to) => {
+      try {
+        realRename(from, to);
+      } catch (error) {
+        held.push(error as NodeJS.ErrnoException);
+        fs.closeSync(handle);
+        throw error;
+      }
     });
-    const closed = once(child, 'close');
     try {
-      const [ready] = await once(child.stdout, 'data');
-      expect(String(ready)).toContain('locked');
       refreshDaemonLock(pidPath, initial, lock);
-      expect(vi.mocked(fs.renameSync).mock.calls.length).toBeGreaterThan(1);
-      expect(JSON.parse(fs.readFileSync(pidPath, 'utf8'))).toEqual(lock);
-      noTemporaryFile();
     } finally {
-      if (child.exitCode === null && child.signalCode === null) child.kill();
-      await closed;
+      if (held.length === 0) fs.closeSync(handle);
     }
-  }, 10_000);
+    expect(held).toHaveLength(1);
+    expect(['EPERM', 'EACCES', 'EBUSY']).toContain(held[0]!.code);
+    expect(vi.mocked(fs.renameSync).mock.calls.length).toBeGreaterThan(1);
+    expect(JSON.parse(fs.readFileSync(pidPath, 'utf8'))).toEqual(lock);
+    noTemporaryFile();
+  });
 });
