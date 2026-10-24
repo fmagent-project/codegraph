@@ -1035,15 +1035,16 @@ impl<'t> Walker<'t> {
     }
 
 
-    /// cppExtractor.isMisparsedFunction (languages/c-cpp.ts:811). cpp only.
+    /// C/C++ isMisparsedFunction: keep recovered control-statement bodies in
+    /// their enclosing caller rather than creating functions named `if`.
     fn is_misparsed_function(&self, name: &str, node: Node) -> bool {
+        if matches!(name, "switch" | "if" | "for" | "while" | "do" | "case" | "return") {
+            return true;
+        }
         if self.variant != Variant::Cpp {
             return false;
         }
         if name.starts_with("namespace") {
-            return true;
-        }
-        if matches!(name, "switch" | "if" | "for" | "while" | "do" | "case" | "return") {
             return true;
         }
         is_macro_misparsed_type_decl(node)

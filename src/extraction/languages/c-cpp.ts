@@ -404,6 +404,10 @@ function extractCppReturnType(node: SyntaxNode, source: string): string | undefi
 }
 
 export const cExtractor: LanguageExtractor = {
+  // Error recovery can read `else if (...) { ... }` across a preprocessor
+  // boundary as a function with return type `else`. Keep its body's calls
+  // in the enclosing function through the existing misparse-body walker.
+  isMisparsedFunction: (name) => ['switch', 'if', 'for', 'while', 'do', 'case', 'return'].includes(name),
   resolveName: (node, source) =>
     recoverSingleArgMacroDefinedName(node, source) ?? unnamedTypeVariableName(node, source),
   // A struct, union or enum defined in a declaration's type is documented by
@@ -2395,9 +2399,74 @@ export function blankCDesignatedMacroArgs(source: string): string {
   return rawStrings.restore(out.join(''));
 }
 
+/**
+ * Alternative C function signatures can share a body after #endif (QP's
+ * tracing-enabled signatures add a sender parameter). Neither signature is
+ * a definition to tree-sitter in that shape. Keep the first signature only
+ * when EVERY branch is a complete header for the same name, with an #else
+ * and a shared opening brace. This chooses a representative signature, not
+ * a build configuration. Complete definitions and nested/partial headers
+ * stay untouched. All offsets, including CRLF, remain unchanged.
+ */
+export function blankCAlternativeFunctionHeaders(source: string): string {
+  if (!source.includes('#')) return source;
+  const code = maskCppCommentsAndLiterals(source);
+  type Region = { start: number; branch: number; headers: [number, number][]; valid: boolean; hasElse: boolean };
+  const stack: Region[] = [];
+  const spans: [number, number][] = [];
+  const headerName = (header: string): string | undefined => {
+    const match = /^\s*(?:[A-Za-z_]\w*[\s*]+)+([A-Za-z_]\w*)\s*\(/.exec(header);
+    if (!match || /[;{}#=]/.test(header)) return undefined;
+    let depth = 1;
+    for (let i = match[0].length; i < header.length; i++) {
+      if (header[i] === '(') depth++;
+      else if (header[i] === ')' && --depth === 0) {
+        return header.slice(i + 1).trim() === '' ? match[1] : undefined;
+      }
+    }
+    return undefined;
+  };
+  // Consume continued directives together: a #if spelled inside a macro
+  // replacement must never open a region of its own.
+  const directives = /^[ \t]*#(?:\\\r?\n|[^\r\n])*/gm;
+  for (const match of code.matchAll(directives)) {
+    const start = match.index!;
+    const end = start + match[0].length;
+    const directive = /^[ \t]*#[ \t]*(\w+)/.exec(match[0])?.[1];
+    const current = stack[stack.length - 1];
+    if (directive === 'if' || directive === 'ifdef' || directive === 'ifndef') {
+      if (current) current.valid = false;
+      stack.push({ start, branch: end, headers: [], valid: true, hasElse: false });
+    } else if (current && (directive === 'else' || directive === 'elif')) {
+      if (current.hasElse) current.valid = false;
+      current.headers.push([current.branch, start]);
+      current.branch = end;
+      if (directive === 'else') current.hasElse = true;
+    } else if (current && directive === 'endif') {
+      stack.pop();
+      current.headers.push([current.branch, start]);
+      if (!current.valid || !current.hasElse || !/^\s*\{/.test(code.slice(end))) continue;
+      const names = current.headers.map(([from, to]) => headerName(code.slice(from, to)));
+      if (!names[0] || names.some((name) => name !== names[0])) continue;
+      const [firstStart, firstEnd] = current.headers[0]!;
+      spans.push([current.start, firstStart], [firstEnd, end]);
+    } else if (current) {
+      current.valid = false;
+    }
+  }
+  if (spans.length === 0) return source;
+  const out = source.split('');
+  for (const [from, to] of spans) {
+    for (let i = from; i < to; i++) if (out[i] !== '\n' && out[i] !== '\r') out[i] = ' ';
+  }
+  return out.join('');
+}
+
 function preParseCSource(source: string): string {
   const rawStrings = maskCppRawStrings(source);
-  source = rawStrings.source;
+  // Run before the directive snapshot so restoreDirectiveLines does not
+  // reintroduce the conditional that split the function header from its body.
+  source = blankCAlternativeFunctionHeaders(rawStrings.source);
   const inner = blankCDesignatedMacroArgs(blankCKernelAnnotations(blankCCplusplusGuardBodies(source)));
   let blanked = blankCLeadingAttrMacros(
     blankLoneMacroLines(

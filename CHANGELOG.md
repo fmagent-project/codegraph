@@ -14,6 +14,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes carried by this fork
 
+- C functions with conditional signatures and a shared body are now indexed, and conditional control statements no longer appear as functions or take calls away from their enclosing function.
+
 - A TypeScript or JavaScript function wrapped in a string-named wrapper whose
   result nothing binds — `Runtime.handler(cmd, Effect.fn("cli.api")(fn))`, an
   array element, an arrow body, a return value — is now indexed under the
