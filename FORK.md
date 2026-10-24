@@ -12,7 +12,7 @@ functions in named object literals (#2300) — are on `main` only.
 It carries this project's
 [PR #1865](https://github.com/colbymchenry/codegraph/pull/1865) for Dart 3
 extension types ([#1784](https://github.com/colbymchenry/codegraph/issues/1784)),
-which was patch 5 here byte for byte, and fixes for three issues reported upstream
+which this fork once carried as a patch, byte for byte, and fixes for three issues reported upstream
 from this project: functions bound through a string-named wrapper
 ([#1747](https://github.com/colbymchenry/codegraph/issues/1747), upstream PR #2002),
 C/C++ functions defined through a single-argument macro
@@ -28,8 +28,8 @@ wrappers nothing binds, and calls into a service's members. Measured on
 1,055 `Effect.fn*("…")(function…)` sites; with patch 2, all 1,055.
 
 The previous base was `e63fe2e` (`main`, 2026-09-27), 363 commits behind this point,
-none of them merges. None of the four patches below was taken upstream in that span:
-all four merged back without a conflict and are byte for byte what they were.
+none of them merges. None of the four patches carried then (the first four below) was taken
+upstream in that span: all four merged back without a conflict and are byte for byte what they were.
 Upstream's generator fix ([#1741](https://github.com/colbymchenry/codegraph/issues/1741))
 still stops short in one place — the two helpers that read a class field's value do
 not list `generator_function`, on either extraction path — so patch 4 stays.
@@ -38,7 +38,7 @@ Upstream shipped the C macro-attribute extraction fix (issue #1211, PR #1311) in
 v1.5.0, so the base carries it natively; the fork no longer needs its own patch
 for it.
 
-**Patches:** four, listed below, each one file of behaviour plus the regression
+**Patches:** five, listed below, each one file of behaviour plus the regression
 test that catches its loss. Apart from them the tree matches the pinned base, so
 the fork stays cheap to re-sync. Every patch lives as a merged pull request here
 and must be **re-applied on each upstream sync** — if a merge drops one, this list
@@ -58,6 +58,8 @@ members that naming leaves unresolved. Each goes when upstream covers its half.
 | `__tests__/fm-agent-effect-ts-resolution.test.ts` | Regression cover for the patch above: a member call on a `yield* Ns.Service` local and a direct call on an imported, self-re-exporting namespace, each picking the right one of two same-named members; the missing-import and shadow declines; the `Ns.Service.create` factory hop; and a bare call never reaching a wrapped function through its string's tail. |
 | `src/extraction/languages/typescript.ts`, `src/extraction/languages/javascript.ts`, `codegraph-kernel/src/tsjs/mod.rs` | **Generator class fields.** A class field holding a generator — `class Repo { loadAll = function* () {…} }`, directly or through a wrapper call — is a method written as a field. Two helpers decide that, one classifying the field and one finding the body to walk, and each lists the node types a field's value may have. Without `generator_function` on those lists the field is a property: no callable node, and the calls in its body attribute to the file. The lists exist once per extraction path — the walker's in the language files, the kernel's in `classify_ts_class_member` and `resolve_field_body` — and have to move together: with one side updated the same source is a method on one extraction path and a property on the other. |
 | `__tests__/fm-agent-generator-class-field.test.ts` | Regression cover for the patch above, in TypeScript and JavaScript: the field is a method under its class's qualified name, the wrapped form is too, its body's call is attributed to it rather than to the file, and both extraction paths return identical nodes, edges and refs for the same source. |
+| `src/extraction/languages/c-cpp.ts`, `codegraph-kernel/src/ccpp/mod.rs` | **C functions with a conditional signature.** Code like QP's `QActive_post_` gives each `#if`/`#else` branch its own header and shares one body after `#endif`; tree-sitter reads neither header as a definition, so the function was missing. `blankCAlternativeFunctionHeaders` keeps the first header and blanks the directives and the other headers — same length, line breaks kept, so offsets do not move — but only when every branch is a complete header for the same name, there is an `#else`, nothing else is nested inside, and `{` follows `#endif`; anything else is left as it was. The kept header is a representative, not a build configuration. Separately, error recovery could read `else if (…) {…}` across a directive as a function named `if`: C now treats a function named after a control keyword as a misparse, as C++ already did, and keeps its body's calls in the enclosing function, on both extraction paths. (#20) |
+| `__tests__/fm-agent-c-conditional-function-headers.test.ts` | Regression cover for the patch above, on both extraction paths with LF and CRLF line endings: a shared body is extracted once at its original lines with its calls; conditional `else if` calls stay with the real caller while a real function named `Q_REQUIRE_ID` is kept; `#elif` and function-pointer parameters; calls resolve to a recovered function in an indexed project; and eight unrelated or ambiguous shapes come out unchanged. |
 
 A sync brings new upstream test files in on its own — they are separate files, so
 git takes them without asking. The case to watch for is upstream *moving* the test
