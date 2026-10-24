@@ -81,8 +81,9 @@ daemon left over from an *older* install, but `isOlderRelease` (`src/mcp/version
 compares plain `X.Y.Z` releases only, so a fork build neither stops an older daemon
 nor is stopped by a newer one — it reports a version mismatch instead. Three
 end-to-end cases in `__tests__/daemon-older-version.test.ts` fail on a fork build for
-that reason (they pass on upstream); CI does not run them. FM-Agent runs `init` and
-`index` from the command line and starts no daemon, so it is unaffected.
+that reason (they pass on upstream); CI runs the whole suite but skips these three
+by name. FM-Agent runs `init` and `index` from the command line and starts no
+daemon, so it is unaffected.
 
 **All install/upgrade entry points point at this fork,** so a fork install never
 silently escapes back to upstream: `install.sh` / `install.ps1` (`REPO` / `$repo`)
