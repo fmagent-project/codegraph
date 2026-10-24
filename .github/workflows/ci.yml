@@ -2,18 +2,22 @@ name: CI
 
 # The fork's value is being able to cut a reliable release when it matters, so
 # gate every PR (and main) on the pieces a release depends on: a clean install,
-# the TypeScript build, and a real native Linux kernel build validated by the
-# kernel walker-parity suites.
+# the TypeScript build, a real native Linux kernel build validated by the
+# kernel walker-parity suites, and the whole test suite. The Release
+# workflow calls this one too, on the commit it is about to publish.
 on:
   pull_request:
   push:
     branches: [main]
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # Called from Release, github.workflow is "Release", so a release's test run
+  # and a push to main never cancel each other.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -38,3 +42,13 @@ jobs:
         # Fail if the native kernel is missing or diverges from the reference
         # walker — CODEGRAPH_KERNEL_EXPECT=1 turns a missing binary into an error.
         run: CODEGRAPH_KERNEL_EXPECT=1 npx vitest run __tests__/kernel-*.test.ts
+
+      - name: Test suite
+        # Three daemon-older-version cases fail on any fork build by design:
+        # they compare plain X.Y.Z releases, and ours carry -fmagent.N
+        # (FORK.md). They are skipped by name because each workspace project's
+        # own exclude list overrides --exclude. The kernel suites run again
+        # here, which takes seconds.
+        run: >-
+          npx vitest run -t
+          "^(?!a launcher meeting a daemon of another version \(#2335\) (finds an older daemon|keeps the older daemon|stops a daemon from an older install))"
