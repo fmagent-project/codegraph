@@ -25,7 +25,10 @@ import { GraphTraverser } from '../graph';
 import { formatContextAsMarkdown, formatContextAsJson } from './formatter';
 import { logDebug } from '../errors';
 import { validatePathWithinRoot, isConfigLeafNode } from '../utils';
-import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
+import {
+  isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier,
+  blankNonAsciiWords, splitAtCjkSwitches, meetsQueryWordFloor,
+} from '../search/query-utils';
 import { LOW_CONFIDENCE_MARKER } from './markers';
 import { findNamedCopybooks, isCopybookInclude } from '../graph/cobol-copybooks';
 import { describeSynthesizedHop } from '../graph/synthesized-hop';
@@ -38,6 +41,21 @@ import { describeSynthesizedHop } from '../graph/synthesized-hop';
 const MAX_COPYBOOK_DECLARATION_ENTRIES = 3;
 
 /**
+ * The most symbol names, and search terms, of one query that
+ * `findRelevantContext` searches the index for. A question or a bag of symbol
+ * names stays well below both: a name like `RefreshTokenService` is one
+ * symbol but several terms (`refreshtokenservice`, `refresh`, `token`,
+ * `service`, stems). A pasted log, document or source file runs to hundreds
+ * of words, and every word costs several searches of the index, so such a
+ * query took minutes on a large project and the prompt hook gave up on it
+ * (#2620). Both lists put code-shaped words (camelCase, snake_case, dotted
+ * names) first and keep the order they appear in, so a long query is searched
+ * by its identifiers and its opening words.
+ */
+export const MAX_QUERY_SYMBOLS = 64;
+export const MAX_QUERY_TERMS = 128;
+
+/**
  * Extract likely symbol names from a natural language query
  *
  * Identifies potential code symbols using patterns:
@@ -46,17 +64,21 @@ const MAX_COPYBOOK_DECLARATION_ENTRIES = 3;
  * - SCREAMING_SNAKE: MAX_RETRIES
  * - dot.notation: app.isPackaged (extracts both sides)
  * - Single words that look like identifiers (no spaces, not common English words)
+ * - Names in other scripts, whole: 로그인, 寻路服务, état (#516, #1262)
  *
  * @param query - Natural language query
  * @returns Array of potential symbol names
  */
-function extractSymbolsFromQuery(query: string): string[] {
+export function extractSymbolsFromQuery(query: string): string[] {
   const symbols = new Set<string>();
+  // The ASCII patterns below would read `état` as `tat`; they see such words
+  // blanked out, and the Unicode pass at the end takes them whole.
+  const asciiView = blankNonAsciiWords(query);
 
   // Extract CamelCase identifiers (2+ chars, starts with letter)
   const camelCasePattern = /\b([A-Z][a-z]+(?:[A-Z][a-z]*)*|[a-z]+(?:[A-Z][a-z]*)+)\b/g;
   let match;
-  while ((match = camelCasePattern.exec(query)) !== null) {
+  while ((match = camelCasePattern.exec(asciiView)) !== null) {
     if (match[1] && match[1].length >= 2) {
       symbols.add(match[1]);
     }
@@ -64,7 +86,7 @@ function extractSymbolsFromQuery(query: string): string[] {
 
   // Extract snake_case identifiers
   const snakeCasePattern = /\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b/gi;
-  while ((match = snakeCasePattern.exec(query)) !== null) {
+  while ((match = snakeCasePattern.exec(asciiView)) !== null) {
     if (match[1] && match[1].length >= 3) {
       symbols.add(match[1]);
     }
@@ -72,7 +94,7 @@ function extractSymbolsFromQuery(query: string): string[] {
 
   // Extract SCREAMING_SNAKE_CASE
   const screamingPattern = /\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\b/g;
-  while ((match = screamingPattern.exec(query)) !== null) {
+  while ((match = screamingPattern.exec(asciiView)) !== null) {
     if (match[1]) {
       symbols.add(match[1]);
     }
@@ -80,7 +102,7 @@ function extractSymbolsFromQuery(query: string): string[] {
 
   // Extract ALL_CAPS acronyms (2+ chars, e.g., REST, HTTP, LRU, API)
   const acronymPattern = /\b([A-Z]{2,})\b/g;
-  while ((match = acronymPattern.exec(query)) !== null) {
+  while ((match = acronymPattern.exec(asciiView)) !== null) {
     if (match[1]) {
       symbols.add(match[1]);
     }
@@ -88,7 +110,7 @@ function extractSymbolsFromQuery(query: string): string[] {
 
   // Extract dot.notation and split into parts (e.g., "app.isPackaged" -> ["app", "isPackaged"])
   const dotPattern = /\b([a-zA-Z][a-zA-Z0-9]*(?:\.[a-zA-Z][a-zA-Z0-9]*)+)\b/g;
-  while ((match = dotPattern.exec(query)) !== null) {
+  while ((match = dotPattern.exec(asciiView)) !== null) {
     if (match[1]) {
       // Add both the full path and individual parts
       symbols.add(match[1]);
@@ -104,9 +126,23 @@ function extractSymbolsFromQuery(query: string): string[] {
   // Extract plain lowercase identifiers (3+ chars, not already matched)
   // Catches symbol names like "undo", "redo", "history", "render", "parse"
   const lowercasePattern = /\b([a-z][a-z0-9]{2,})\b/g;
-  while ((match = lowercasePattern.exec(query)) !== null) {
+  while ((match = lowercasePattern.exec(asciiView)) !== null) {
     if (match[1]) {
       symbols.add(match[1]);
+    }
+  }
+
+  // Names with a letter outside ASCII, whole runs only (#2005 keeps partial
+  // Chinese words out of search): `로그인`, `寻路服务`, `état`. A name that
+  // switches between Han, kana or Hangul and another script, or joins words
+  // with `_`, is tried as written (`get用户信息`) and by its words, so
+  // `NavMeshAgent类型` also names `类型`; its ASCII side is the patterns' above.
+  for (const run of query.match(/[\p{L}\p{N}\p{M}_$]+/gu) ?? []) {
+    if (!/[^\x00-\x7F]/.test(run)) continue;
+    const words = run.split(/[_$]+/).flatMap(splitAtCjkSwitches);
+    if (words.length > 1 && meetsQueryWordFloor(run)) symbols.add(run);
+    for (const word of words) {
+      if (/[^\x00-\x7F]/.test(word) && meetsQueryWordFloor(word)) symbols.add(word);
     }
   }
 
@@ -220,9 +256,14 @@ export class ContextBuilder {
    * and its non-production budget cap are deliberately NOT joined: those REMOVE
    * content, and `deprioritize` is a ranking lever by definition — `exclude` is
    * the lever for taking things out of reach.
+   *
+   * Returned as a predicate with the patterns read once, for the candidate
+   * loops of one search: asking the live matcher per candidate re-checked
+   * `codegraph.json` hundreds of thousands of times on a long query (#2620).
    */
-  private isDeprioritized(filePath: string): boolean {
-    return this.queries.getDeprioritizedPathMatcher()?.(filePath) ?? false;
+  private deprioritizedPaths(): (filePath: string) => boolean {
+    const matcher = this.queries.getDeprioritizedPathSnapshot?.() ?? this.queries.getDeprioritizedPathMatcher?.();
+    return (filePath) => matcher?.(filePath) ?? false;
   }
 
   /**
@@ -473,7 +514,7 @@ export class ContextBuilder {
     // === HYBRID SEARCH ===
 
     // Step 1: Extract potential symbol names from query
-    const symbolsFromQuery = extractSymbolsFromQuery(query);
+    const symbolsFromQuery = extractSymbolsFromQuery(query).slice(0, MAX_QUERY_SYMBOLS);
     logDebug('Extracted symbols from query', { query, symbols: symbolsFromQuery });
 
     // Step 2: Look up exact matches for extracted symbols
@@ -639,7 +680,8 @@ export class ContextBuilder {
       // fell through to the fuzzy fallback and returned whatever program name
       // sat within edit distance (`CVACT01Y` → `CBACT01C`).
       const searchTerms = extractSearchTerms(query)
-        .filter((term) => !copybooks.members.has(term.toUpperCase()));
+        .filter((term) => !copybooks.members.has(term.toUpperCase()))
+        .slice(0, MAX_QUERY_TERMS);
       if (searchTerms.length > 0) {
         // Search each term individually to get broader coverage,
         // then boost results that match multiple terms
@@ -759,7 +801,7 @@ export class ContextBuilder {
     // than nodes matching just one generic term. Without this, "ExecutionUtils"
     // (matches only "execution") fills budget slots meant for "ShardSearchRequest"
     // (matches "shard" + "search" + "request").
-    const queryTermsForBoost = extractSearchTerms(query);
+    const queryTermsForBoost = extractSearchTerms(query).slice(0, MAX_QUERY_TERMS);
     if (queryTermsForBoost.length >= 2) {
       // Group terms that are substrings of each other (stem variants of the same
       // root word). "indexed", "indexe", "index" should count as ONE concept match,
@@ -853,6 +895,18 @@ export class ContextBuilder {
       // SEPARATE LIKE batch so one hot single-word term can't crowd classes
       // out of the length-ordered 200-row batch.
       const camelCallableKinds: NodeKind[] = ['function', 'method', 'component'];
+      // A path's relevance to the query depends on nothing else, and the
+      // candidates of every term share their files: score each path once.
+      const isDeprioritized = this.deprioritizedPaths();
+      const pathScores = new Map<string, number>();
+      const pathScoreOf = (filePath: string): number => {
+        let score = pathScores.get(filePath);
+        if (score === undefined) {
+          score = scorePathRelevance(filePath, query, undefined, isDeprioritized(filePath));
+          pathScores.set(filePath, score);
+        }
+        return score;
+      };
       const camelSearchedTerms = new Set<string>();
       const searchIdSet = new Set(searchResults.map(r => r.node.id));
       // Track per-node term hits for multi-term boosting
@@ -902,12 +956,7 @@ export class ContextBuilder {
           if (searchIdSet.has(r.node.id)) continue;
           if (isTestFile(r.node.filePath) && !isTestQuery) continue;
 
-          const pathScore = scorePathRelevance(
-            r.node.filePath,
-            query,
-            undefined,
-            this.isDeprioritized(r.node.filePath),
-          );
+          const pathScore = pathScoreOf(r.node.filePath);
           const brevityBonus = Math.max(0, 6 - (name.length - titleCased.length) / 4);
           termCandidates.push({ node: r.node, score: 8 + brevityBonus + pathScore });
         }
@@ -994,12 +1043,7 @@ export class ContextBuilder {
         const compoundResults: SearchResult[] = [];
         for (const [, entry] of compoundTermMap) {
           if (entry.terms.size >= 2) {
-            const pathScore = scorePathRelevance(
-              entry.node.filePath,
-              query,
-              undefined,
-              this.isDeprioritized(entry.node.filePath),
-            );
+            const pathScore = pathScoreOf(entry.node.filePath);
             const brevityBonus = Math.max(0, 6 - entry.node.name.length / 8);
             compoundResults.push({
               node: entry.node,
@@ -1120,13 +1164,16 @@ export class ContextBuilder {
       if (hierarchyNodesAdded >= maxHierarchyNodes) break;
       if (typeHierarchyKinds.has(result.node.kind)) {
         const hierarchy = this.traverser.getTypeHierarchy(result.node.id);
+        // The budget holds per node: a widely implemented interface brings
+        // its whole descendant tree (IDisposable: hundreds of types).
         for (const [id, node] of hierarchy.nodes) {
-          if (!nodes.has(id)) {
+          if (!nodes.has(id) && hierarchyNodesAdded < maxHierarchyNodes) {
             nodes.set(id, node);
             hierarchyNodesAdded++;
           }
         }
         for (const edge of hierarchy.edges) {
+          if (!nodes.has(edge.source) || !nodes.has(edge.target)) continue;
           const exists = edges.some(
             (e) => e.source === edge.source && e.target === edge.target && e.kind === edge.kind
           );

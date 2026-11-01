@@ -3,8 +3,10 @@
  *
  * Multi-target: writes MCP server config + instructions for the
  * agents the user picks (Claude Code, Cursor, Codex CLI, opencode,
- * Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, and GitHub
- * Copilot in VS Code / the Copilot CLI / JetBrains IDEs).
+ * Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, GitHub Copilot in
+ * VS Code / the Copilot CLI / JetBrains IDEs, IBM Bob, Factory Droid,
+ * Windsurf, Qwen Code, DeepSeek Harness, Grok Build, Kimi Code, the
+ * Qoder CLI, and Pi).
  * Defaults to the Claude-only behavior for backwards compatibility
  * when no targets are explicitly chosen and nothing else is detected.
  *
@@ -22,7 +24,7 @@ import {
   getTarget,
   resolveTargetFlag,
 } from './targets/registry';
-import type { AgentTarget, Location, TargetId } from './targets/types';
+import type { AgentTarget, Location, TargetId, WriteResult } from './targets/types';
 // Import the lightweight submodules directly (not the ../sync barrel, which
 // re-exports FileWatcher and would transitively pull in ../extraction — the
 // installer must stay importable even when native modules can't load).
@@ -161,16 +163,17 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     }
   }
 
-  // Step 4: auto-allow permissions (only meaningful for Claude;
-  // skipped silently by other targets).
+  // Step 4: auto-allow permissions (only meaningful for Claude Code and
+  // Qwen Code; skipped silently by other targets).
+  const autoAllowAgents = targets.filter((t) => t.id === 'claude' || t.id === 'qwen').map((t) => t.displayName);
   let autoAllow: boolean;
   if (opts.autoAllow !== undefined) {
     autoAllow = opts.autoAllow;
   } else if (useDefaults) {
     autoAllow = true;
-  } else if (targets.some((t) => t.id === 'claude')) {
+  } else if (autoAllowAgents.length > 0) {
     const ans = await clack.confirm({
-      message: 'Auto-allow CodeGraph commands? (Skips permission prompts in Claude Code)',
+      message: `Auto-allow CodeGraph commands? (Skips permission prompts in ${autoAllowAgents.join(' and ')})`,
       initialValue: true,
     });
     if (clack.isCancel(ans)) {
@@ -380,13 +383,13 @@ export function uninstallTargets(
   });
 }
 
-export type RefreshStatus = 'refreshed' | 'unchanged' | 'not-configured' | 'unsupported';
+export type RefreshStatus = 'refreshed' | 'unchanged' | 'not-configured' | 'unsupported' | 'failed';
 
 /**
  * Per-target outcome of a refresh sweep. `refreshed` means at least one
  * filesystem entry was created, updated, or removed; `unchanged` means the target was
- * already current (every write reported byte-identical); the other two
- * mirror `UninstallStatus`.
+ * already current (every write reported byte-identical); `failed` means a
+ * write threw (`error` says why); the other two mirror `UninstallStatus`.
  */
 export interface RefreshReport {
   id: TargetId;
@@ -395,6 +398,8 @@ export interface RefreshReport {
   status: RefreshStatus;
   /** Absolute paths created, updated, or removed by the refresh. */
   changedPaths: string[];
+  /** Why the refresh of this target failed (status `failed` only). */
+  error?: string;
 }
 
 /**
@@ -428,7 +433,16 @@ export function refreshTargets(
     if (!target.detect(location).alreadyConfigured) {
       return { ...base, status: 'not-configured' as const, changedPaths: [] };
     }
-    const result = target.install(location, { autoAllow: false, promptHook: undefined });
+    let result: WriteResult;
+    try {
+      result = target.install(location, { autoAllow: false, promptHook: undefined });
+    } catch (err) {
+      // One agent's file that can't be written (a symbolic link to a
+      // read-only file, say: #2721) must not stop the rest of the sweep
+      // `codegraph upgrade` runs.
+      const error = err instanceof Error ? err.message : String(err);
+      return { ...base, status: 'failed' as const, changedPaths: [], error };
+    }
     const changedPaths = result.files
       .filter((f) => f.action === 'created' || f.action === 'updated' || f.action === 'removed')
       .map((f) => f.path);
@@ -469,8 +483,8 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
     const sel = await clack.select({
       message: 'Remove CodeGraph from all your projects, or just this one?',
       options: [
-        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro, ~/.copilot, ~/.config/github-copilot' },
-        { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./.vscode, ./opencode.jsonc, ./.gemini, ./.kiro' },
+        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro, ~/.copilot, ~/.config/github-copilot, ~/.bob, ~/.factory, ~/.codeium/windsurf, ~/.qwen, ~/.dsh, ~/.grok, ~/.kimi-code, ~/.qoder, ~/.pi' },
+        { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./.vscode, ./opencode.jsonc, ./.gemini, ./.kiro, ./.bob, ./.factory, ./.qwen, ./.grok, ./.kimi-code, ./.qoder, ./.pi' },
       ],
       initialValue: 'global' as const,
     });
@@ -506,10 +520,14 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
         clack.log.success(`${r.displayName}: removed ${tildify(p)}`);
       }
     } else if (r.status === 'not-configured') {
-      clack.log.info(`${r.displayName}: not configured — nothing to remove`);
+      clack.log.info(r.notes.length > 0 ? `${r.displayName}: nothing removed` : `${r.displayName}: not configured — nothing to remove`);
     } else {
       clack.log.info(`${r.displayName}: skipped — ${r.notes[0] ?? 'unsupported location'}`);
+      continue;
     }
+    // What a target couldn't remove on its own (e.g. a Codex entry inside
+    // an inline table, #2562).
+    for (const note of r.notes) clack.log.warn(`${r.displayName}: ${note}`);
   }
 
   // Step 4: for local uninstall, the index dir is separate — point at
@@ -718,6 +736,13 @@ export async function offerWatchFallback(
     clack.log.warn(
       `Could not install git hooks${result.skipped ? ` (${result.skipped})` : ''}. ` +
       'Run `codegraph sync` after changes instead.',
+    );
+  }
+  if (result.unsupported && result.unsupported.length > 0) {
+    clack.log.warn(
+      `Left your ${result.unsupported.join(', ')} hook${result.unsupported.length > 1 ? 's' : ''} unchanged — ` +
+      `${result.unsupported.length > 1 ? 'they are' : 'it is'} not a shell script. ` +
+      `Add \`codegraph sync ${projectPath}\` to ${result.unsupported.length > 1 ? 'them' : 'it'} to refresh the index there too.`,
     );
   }
 }

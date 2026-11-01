@@ -35,6 +35,7 @@ import { resolveProjectFile } from '../security';
 import { findIndexedFile, hasDriftedOnDisk } from './source';
 import { createWhenReader } from './when';
 import { toNodeRef, type WireNodeRef } from './wire';
+import { escapeRegExp } from '../../utils';
 
 // =============================================================================
 // Wire shapes
@@ -182,7 +183,9 @@ function arrivesFromAnotherContext(edge: Edge): boolean {
   // The cross-tier synthesizer marks every edge it makes with the tier it
   // crossed (a client's fetch onto its route, a queue job onto its consumer).
   if (meta.tier !== undefined) return true;
-  return meta.synthesizedBy === 'rn-event-channel';
+  // A Next proxy runs before every route it covers, and no route called it: a
+  // redirect written in the proxy is on no screen.
+  return meta.synthesizedBy === 'rn-event-channel' || meta.synthesizedBy === 'next-proxy';
 }
 
 /** A component rendered by at least this many screens is chrome, not a screen's own behaviour. */
@@ -586,7 +589,7 @@ function mentionsOf(cg: CodeGraph, projectRoot: string, value: Node): Edge[] {
     .slice(0, MAX_MENTION_FILES);
   if (importers.length === 0) return out;
   const files = cg.getNodesByIds(importers);
-  const word = new RegExp(`(?<![\\w$.])${value.name.replace(/\$/g, '\\$')}(?![\\w$])`);
+  const word = new RegExp(`(?<![\\w$.])${escapeRegExp(value.name)}(?![\\w$])`);
   for (const file of files.values()) {
     if (file.kind !== 'file') continue;
     const found = findIndexedFile(cg, file.filePath.replace(/\\/g, '/'));

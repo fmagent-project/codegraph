@@ -10,6 +10,8 @@
  * wasm fallback. When run from source instead, it requires Node >= 22.5.
  */
 
+import { loadNodeSqlite } from './node-sqlite';
+import { toDatabaseOpenError } from './open-error';
 import { toWslSharedIndexError } from './wsl-shared-index';
 
 export interface SqliteStatement {
@@ -25,11 +27,22 @@ export interface SqliteStatement {
   iterate(...params: any[]): IterableIterator<any>;
 }
 
+export interface TransactionOptions {
+  /**
+   * Begin with `BEGIN IMMEDIATE`, taking the write lock up front, instead of a
+   * deferred `BEGIN`. A connection that finds the lock taken then waits it out
+   * (busy_timeout); a deferred transaction that has already read gets
+   * SQLITE_BUSY at once when it comes to write, since SQLite will not wait for
+   * a lock there. No effect when nested in an open transaction.
+   */
+  immediate?: boolean;
+}
+
 export interface SqliteDatabase {
   prepare(sql: string): SqliteStatement;
   exec(sql: string): void;
   pragma(str: string, options?: { simple?: boolean }): any;
-  transaction<T>(fn: (...args: any[]) => T): (...args: any[]) => T;
+  transaction<T>(fn: (...args: any[]) => T, options?: TransactionOptions): (...args: any[]) => T;
   close(): void;
   readonly open: boolean;
   /** Undefined on a runtime without `isTransaction`; callers must then not memoize. */
@@ -57,8 +70,7 @@ class NodeSqliteAdapter implements SqliteDatabase {
   private readonly _dbPath: string;
 
   constructor(dbPath: string, opts?: { readOnly?: boolean }) {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { DatabaseSync } = require('node:sqlite');
+    const { DatabaseSync } = loadNodeSqlite();
     this._dbPath = dbPath;
     this._db = opts?.readOnly ? new DatabaseSync(dbPath, { readOnly: true }) : new DatabaseSync(dbPath);
   }
@@ -152,7 +164,7 @@ class NodeSqliteAdapter implements SqliteDatabase {
     return row;
   }
 
-  transaction<T>(fn: (...args: any[]) => T): (...args: any[]) => T {
+  transaction<T>(fn: (...args: any[]) => T, options?: TransactionOptions): (...args: any[]) => T {
     return (...args: any[]) => {
       // Nested call (a transaction()-wrapped helper invoked from inside another
       // transaction): run the body directly inside the enclosing transaction.
@@ -167,7 +179,7 @@ class NodeSqliteAdapter implements SqliteDatabase {
           this._txDepth--;
         }
       }
-      this._db.exec('BEGIN');
+      this._db.exec(options?.immediate ? 'BEGIN IMMEDIATE' : 'BEGIN');
       this._txDepth = 1;
       try {
         const result = fn(...args);
@@ -200,15 +212,8 @@ export function createDatabase(dbPath: string, opts?: { readOnly?: boolean }): {
   try {
     return { db: new NodeSqliteAdapter(dbPath, opts), backend: 'node-sqlite' };
   } catch (error) {
-    // node:sqlite loaded and SQLite itself failed — not a missing-module case.
-    const shared = toWslSharedIndexError(error, dbPath);
-    if (shared) throw shared;
-    const msg = error instanceof Error ? error.message : String(error);
-    throw new Error(
-      'Failed to open SQLite via the built-in node:sqlite module.\n' +
-      'CodeGraph requires node:sqlite (Node.js 22.5+). Install the self-contained\n' +
-      'CodeGraph release (it bundles a compatible Node), or run on Node 22.5+.\n' +
-      `Underlying error: ${msg}`
-    );
+    // A runtime without node:sqlite says so (NodeSqliteUnavailableError);
+    // anything SQLite itself reported names its code and the path.
+    throw toDatabaseOpenError(error, dbPath);
   }
 }

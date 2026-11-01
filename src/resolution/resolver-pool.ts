@@ -81,6 +81,15 @@ export function shouldEngageAdaptively(projectedMs: number, remainingRefs: numbe
   return remainingRefs >= ADAPTIVE_ENGAGE_MIN_REFS && projectedMs >= barMs;
 }
 
+/**
+ * What a resolver worker's heap may hold of new objects. Resolving keeps many
+ * of them alive for a while, so V8 grows this space as far as it may: 192 MB a
+ * worker on Node 24, where it was the larger part of a big repo's peak memory,
+ * and 48 MB on Node 22. At 48 MB the peak is about a quarter lower and CPU time
+ * doesn't move.
+ */
+const WORKER_YOUNG_GENERATION_MB = 48;
+
 export class ResolverPool {
   private workers: PoolWorker[] = [];
   private nextId = 0;
@@ -138,7 +147,7 @@ export class ResolverPool {
    * otherwise. `CODEGRAPH_RESOLVE_WORKERS` overrides the computed size
    * (0 disables the pool; values are capped at 16).
    */
-  static tryCreate(dbPath: string, projectRoot: string): ResolverPool | null {
+  static tryCreate(dbPath: string, projectRoot: string, frameworks?: readonly string[]): ResolverPool | null {
     if (process.env.CODEGRAPH_NO_PARALLEL_RESOLVE === '1') return null;
     const workerScript = path.join(__dirname, 'resolver-worker.js');
     if (!fs.existsSync(workerScript)) return null;
@@ -163,15 +172,15 @@ export class ResolverPool {
     }
     if (size === null) return null;
     try {
-      return new ResolverPool(workerScript, dbPath, projectRoot, size);
+      return new ResolverPool(workerScript, dbPath, projectRoot, size, frameworks);
     } catch {
       return null;
     }
   }
 
-  private constructor(workerScript: string, dbPath: string, projectRoot: string, size: number) {
+  private constructor(workerScript: string, dbPath: string, projectRoot: string, size: number, frameworks?: readonly string[]) {
     for (let i = 0; i < size; i++) {
-      const worker = new Worker(workerScript);
+      const worker = new Worker(workerScript, { resourceLimits: { maxYoungGenerationSizeMb: WORKER_YOUNG_GENERATION_MB } });
       const started = workerStarted(worker);
       let readyResolve!: () => void;
       let readyReject!: (e: Error) => void;
@@ -229,7 +238,7 @@ export class ResolverPool {
           readyReject(this.failed!);
         }
       });
-      worker.postMessage({ type: 'open', dbPath, projectRoot });
+      worker.postMessage({ type: 'open', dbPath, projectRoot, frameworks });
       this.workers.push(pw);
     }
   }

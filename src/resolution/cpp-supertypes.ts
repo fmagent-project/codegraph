@@ -29,7 +29,11 @@
  *    (`fmt::detail::buffer` under fmt's FMT_BEGIN_NAMESPACE);
  *  - a class a source file (`.cc`, `.cpp`, `.c`) defines belongs to that
  *    translation unit, so only that file sees it (leveldb's skiplist test
- *    declares its own `leveldb::Comparator`);
+ *    declares its own `leveldb::Comparator`) — and so does a name a header
+ *    writes, read for code in that file, which includes the header: a
+ *    pimpl's `std::unique_ptr<Rep> rep_`, whose `Table::Rep` the source file
+ *    calling through it defines (leveldb's `Table`, rocksdb's
+ *    `BlockBasedTableBuilder`);
  *  - a template parameter (`template <class Base> class X : public Base`) or
  *    a member of one (`public T::Base`) is whatever a template argument makes
  *    it: no edge.
@@ -44,7 +48,8 @@
  *
  * The same lookup (cppClassWritten) finds the class a `std::unique_ptr`,
  * `std::shared_ptr` or `std::optional` holds, for a `->` call on it, looked
- * up from the calling function (name-matcher's matchCppHeldTypeCall).
+ * up from the calling function (name-matcher's matchCppHeldTypeCall), and the
+ * type a member or an alias is declared with (matchCppDeclaredType).
  */
 import type { Node } from '../types';
 import type { ResolvedRef, ResolutionContext, UnresolvedRef } from './types';
@@ -53,14 +58,19 @@ import {
   cppParentScope,
   cppScopesWithin,
   cppTemplateParameters,
+  cppTypeNamed,
   cppTypeSegments,
   stripCppTemplateArguments,
-  type CppNamedClass,
+  type CppNamedType,
 } from './cpp-type-aliases';
+import { cMacroRename } from './c-macro-renames';
+import { cppIncluders } from './cpp-includers';
 import { cppMacroNamespaceFrames, cppNamespaceAliases } from './cpp-namespaces';
 import { stripCommentsForRegex } from './strip-comments';
 
 const CLASS_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'union']);
+/** What a member's type can name. */
+const TYPE_KINDS: ReadonlySet<string> = new Set([...CLASS_KINDS, 'enum', 'type_alias']);
 
 /** A C or C++ source file, whose definitions belong to its own translation unit. */
 const SOURCE_FILE = /\.(?:c|cc|cpp|cxx|c\+\+|cu|metal)$/i;
@@ -76,14 +86,26 @@ function isCFamily(n: Node): boolean {
 }
 
 /**
- * The declarations code at `site` can see (visibleFrom), where a class local
- * to a function counts only in that function's lines: the index names it
- * after the function, and every gtest `TEST_F` body in a namespace is
- * `ns::TEST_F`, so one body's local `Listener` passed for any other's — in
- * the body itself, and in the methods of a local class of its own.
+ * Does `ref` name the type a C or C++ class's member or an alias is declared
+ * with? Extraction writes no other `references` from either: a value read is
+ * its function's.
  */
-function seenFrom(site: CppNameSite, context: ResolutionContext): (n: Node) => boolean {
-  const visible = visibleFrom(site.file);
+export function isCppDeclaredTypeRef(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.referenceKind !== 'references' || (ref.language !== 'cpp' && ref.language !== 'c')) return false;
+  const holder = context.getNodeById?.(ref.fromNodeId);
+  return !!holder && isCFamily(holder) && (CLASS_KINDS.has(holder.kind) || holder.kind === 'type_alias');
+}
+
+/**
+ * The declarations code at `site` can see (visibleFrom), read for code in
+ * the file `unit`, where a class local to a function counts only in that
+ * function's lines: the index names it after the function, and every gtest
+ * `TEST_F` body in a namespace is `ns::TEST_F`, so one body's local
+ * `Listener` passed for any other's — in the body itself, and in the methods
+ * of a local class of its own.
+ */
+function seenFrom(site: CppNameSite, context: ResolutionContext, unit?: string): (n: Node) => boolean {
+  const visible = visibleFrom(site.file, unit);
   return (n) => {
     if (!visible(n)) return false;
     const fn = cppFunctionAround(n, context);
@@ -111,9 +133,12 @@ function cppFunctionAround(cls: Node, context: ResolutionContext): Node | null {
   return fn;
 }
 
-/** The declarations code in `file` can see: a header's, and the file's own. */
-function visibleFrom(file: string): (n: Node) => boolean {
-  return (n) => n.filePath === file || !SOURCE_FILE.test(n.filePath);
+/**
+ * The declarations code in `file` can see: a header's, and the file's own —
+ * and, read for code in the file `unit` (one that includes `file`), `unit`'s.
+ */
+function visibleFrom(file: string, unit?: string): (n: Node) => boolean {
+  return (n) => n.filePath === file || n.filePath === unit || !SOURCE_FILE.test(n.filePath);
 }
 
 export function matchCppSupertype(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
@@ -132,6 +157,51 @@ export function matchCppSupertype(ref: UnresolvedRef, context: ResolutionContext
     : { original: ref, targetNodeId: found.node.id, confidence: 0.7, resolvedBy: 'exact-match' };
 }
 
+/**
+ * The type a member of a C or C++ class or an alias is declared with: what C++
+ * name lookup finds from inside the class, as the class's base is found. Only a
+ * type can be named there, so a function or macro of that name is never a
+ * candidate, and a list's own `next` links nothing.
+ */
+export function matchCppDeclaredType(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const holder = context.getNodeById?.(ref.fromNodeId);
+  if (!holder) return null;
+  const site: CppNameSite = {
+    scope: holder.kind === 'type_alias' ? cppParentScope(holder.qualifiedName) : holder.qualifiedName,
+    file: holder.filePath,
+    line: ref.line,
+    parameters: cppTemplateParameters(holder, context),
+    declared: true,
+  };
+  // A macro the file sees can rename the type (`#define sds hisds`), and a type
+  // the new name doesn't reach is left as written.
+  const renamed = cMacroRename(ref.referenceName, site.file, ref.line, ref.language, context);
+  const found = (renamed && cppClassWritten(renamed, site, ref, context)) || cppClassWritten(ref.referenceName, site, ref, context);
+  const node = found === undefined ? definedByIncluder(ref.referenceName, site, context) : found?.node;
+  if (!node || node.id === holder.id) return null;
+  return found?.exact
+    ? { original: ref, targetNodeId: node.id, confidence: 0.9, resolvedBy: 'qualified-name' }
+    : { original: ref, targetNodeId: node.id, confidence: 0.7, resolvedBy: 'exact-match' };
+}
+
+/**
+ * The type a header names and only a source file including it defines, which
+ * no other file can see: `struct Rep; Rep* rep_;`, `struct dictEntry *e`.
+ * Several such definitions would be a guess.
+ */
+function definedByIncluder(written: string, site: CppNameSite, context: ResolutionContext): Node | undefined {
+  const segments = cppTypeSegments(written);
+  if (!segments) return undefined;
+  const path = segments.join('::');
+  const spelled = new Set(cppScopesWithin(site.scope).map((scope) => (scope ? `${scope}::${path}` : path)));
+  const candidates = context.getNodesByName(segments[segments.length - 1]!).filter((n) =>
+    isCFamily(n) && n.kind !== 'type_alias' && TYPE_KINDS.has(n.kind) && spelled.has(n.qualifiedName));
+  if (candidates.length === 0) return undefined;
+  const includers = cppIncluders(site.file, context);
+  const defined = candidates.filter((n) => includers.has(n.filePath));
+  return defined.length === 1 ? defined[0] : undefined;
+}
+
 /** Where a C or C++ type name is written, which is where its lookup starts. */
 export interface CppNameSite {
   /**
@@ -146,6 +216,11 @@ export interface CppNameSite {
   parameters: ReadonlySet<string>;
   /** A class the name cannot be: the deriving class, in its own base clause. */
   self?: Node;
+  /**
+   * Find what the name itself declares: an enum counts, and an alias is the
+   * answer rather than a step on the way to the class it names.
+   */
+  declared?: boolean;
   /**
    * A class looked in right after `scope` itself, its bases included: a gtest
    * `TEST_F` body is a member function of a class derived from its fixture,
@@ -176,13 +251,16 @@ export function cppClassWritten(written: string, site: CppNameSite, ref: Unresol
   const global = written.startsWith('::');
   if (!global && site.parameters.has(segments[0]!)) return null;
 
-  const visible = seenFrom(site, context);
+  // (For code in the reference's own file: the file it is in includes the one that writes the name.)
+  const visible = seenFrom(site, context, ref.filePath);
   const scopes = cppScopesWithin(site.scope);
   if (site.classScope) scopes.splice(1, 0, site.classScope);
   const resolved = (node: Node): CppWrittenClass => ({ node, exact: true });
+  const named = (spelled: string, from: readonly string[]): CppNamedType =>
+    (site.declared ? cppTypeNamed : cppClassNamed)(spelled, from, ref, context, visible);
 
   // The scopes around the name short of the global one, or only the global one for `::Base`.
-  const lexical = classNode(cppClassNamed(written, global ? [''] : scopes.slice(0, -1), ref, context, visible), site, context);
+  const lexical = classNode(named(written, global ? [''] : scopes.slice(0, -1)), site, context, visible);
   if (lexical !== undefined) return lexical && resolved(lexical);
 
   // What the file writes before the name, the nearest first: each stands for
@@ -193,7 +271,7 @@ export function cppClassWritten(written: string, site: CppNameSite, ref: Unresol
   const usings = usingsIn(site.file, context).filter((u) => u.line < site.line).reverse();
   const lookUp = (spelled: string): Node | undefined => {
     const absolute = spelled.startsWith('::');
-    return classNode(cppClassNamed(spelled, absolute ? [''] : scopes, ref, context, visible), site, context) ?? undefined;
+    return classNode(named(spelled, absolute ? [''] : scopes), site, context, visible) ?? undefined;
   };
   // `::_pbi::MessageGlobalsBase` under `namespace _pbi = ::google::protobuf::internal;`.
   if (segments.length > 1) {
@@ -208,6 +286,9 @@ export function cppClassWritten(written: string, site: CppNameSite, ref: Unresol
       if (u.kind !== 'declaration' || u.name !== segments[0]) continue;
       const hit = lookUp(u.path + after);
       if (hit) return resolved(hit);
+      // `using std::string;`: the file says where the name comes from, and it
+      // is nothing the project declares, whatever else shares its name.
+      if (site.declared) return null;
     }
     // `using namespace ROCKSDB_NAMESPACE;` … `public EventListener`.
     for (const u of usings) {
@@ -216,7 +297,7 @@ export function cppClassWritten(written: string, site: CppNameSite, ref: Unresol
       if (hit) return resolved(hit);
     }
     // The global scope.
-    const outermost = classNode(cppClassNamed(written, [''], ref, context, visible), site, context);
+    const outermost = classNode(named(written, ['']), site, context, visible);
     if (outermost !== undefined) return outermost && resolved(outermost);
   }
   // `fmt::detail::buffer`, where a macro opens `namespace fmt` around `detail::buffer`.
@@ -225,9 +306,13 @@ export function cppClassWritten(written: string, site: CppNameSite, ref: Unresol
       .filter((n) => macroQualifiedName(n, context) === path), site.file);
     if (hit) return resolved(hit);
   }
-  // The only class of that name the file can see, by its qualified tail.
+  // The only class of that name the file can see, by its qualified tail. For a
+  // declared type, only in C: a struct nested in another is C's as much as any,
+  // while a C++ name no lookup found is outside the project far more often than
+  // it is a class of some other scope (rocksdb's `pthread_key_t`, the system's,
+  // beside its `port::pthread_key_t`).
   const tail = namedClasses(segments, site, context, visible)
-    .filter((n) => n.qualifiedName === path || n.qualifiedName.endsWith(`::${path}`));
+    .filter((n) => (!site.declared || n.language === 'c') && (n.qualifiedName === path || n.qualifiedName.endsWith(`::${path}`)));
   const own = tail.filter((n) => n.filePath === site.file);
   const sole = own.length > 0 ? own : tail;
   return sole.length === 1 ? { node: sole[0]!, exact: false } : undefined;
@@ -267,19 +352,51 @@ function writtenBase(ref: UnresolvedRef, context: ResolutionContext): string {
 }
 
 /**
- * The node of the class a lookup found, as the file that writes the name sees
- * it (null: the name names no particular class; undefined: keep looking).
+ * The node of the class a lookup found, among the declarations the lookup can
+ * see (`visible`; null: the name names no particular class; undefined: keep
+ * looking).
  */
-function classNode(named: CppNamedClass, site: CppNameSite, context: ResolutionContext): Node | null | undefined {
+function classNode(named: CppNamedType, site: CppNameSite, context: ResolutionContext, visible: (n: Node) => boolean): Node | null | undefined {
   if (named === null || named === undefined) return named;
+  if (site.declared) return declarationNode(named, site, context, visible);
   if ('alias' in named) return named.alias;
+  if ('enums' in named) return null;
   const classes = context
     .getNodesByQualifiedName(named.cls)
     .filter((n) => isCFamily(n) && CLASS_KINDS.has(n.kind) && n.id !== site.self?.id);
   // A lookup that ended on the class itself (its namespace lost) found nothing.
   if (classes.length === 0) return undefined;
-  const visible = classes.filter(seenFrom(site, context));
-  return pick(visible.length > 0 ? visible : classes, site.file);
+  const shown = classes.filter(visible);
+  return pick(shown.length > 0 ? shown : classes, site.file);
+}
+
+/**
+ * The declaration a type name found by a lookup stands for, among all that one
+ * qualified name declares. C spreads a type over files, so that a class in
+ * some other folder can be the only one a lookup sees: redis's `dictEntry` is
+ * `typedef struct dictEntry dictEntry;` in src/dict.h and a struct in src/dict.c,
+ * which only that file sees, while deps/hiredis/dict.h declares its own. What
+ * the file itself declares or includes comes first, then any header. A class
+ * beats an alias of its name, and the alias is the class's when a file that
+ * includes the alias defines it.
+ */
+function declarationNode(named: NonNullable<CppNamedType>, site: CppNameSite, context: ResolutionContext, visible: (n: Node) => boolean): Node | undefined {
+  const name = 'cls' in named ? named.cls : 'alias' in named ? named.alias.qualifiedName : named.enums[0]!.qualifiedName;
+  const all = context.getNodesByQualifiedName(name).filter((n) => isCFamily(n) && TYPE_KINDS.has(n.kind));
+  if (all.length <= 1) return all[0];
+  const defined = (nodes: Node[]): Node[] => nodes.filter((n) => n.kind !== 'type_alias');
+  const seen = all.filter(visible);
+  const own = seen.filter((n) => n.filePath === site.file);
+  // (Several in the file: the `#if` arms of one type, or the partial
+  // specializations of a template, whose members index under one name. The
+  // nearest above is the one in force.)
+  const above = own.filter((n) => n.startLine <= site.line).sort((a, b) => b.startLine - a.startLine);
+  const included = above.length > 0 ? above.slice(0, 1) : own.length > 0 ? own : seen.filter((n) => cppIncluders(n.filePath, context).has(site.file));
+  const near = included.length > 0 ? included : seen;
+  const found = pick(defined(near).length > 0 ? defined(near) : near, site.file);
+  if (found?.kind !== 'type_alias') return found;
+  const includers = cppIncluders(found.filePath, context);
+  return pick(defined(all).filter((n) => includers.has(n.filePath)), found.filePath) ?? found;
 }
 
 /**
@@ -306,9 +423,10 @@ function pick(classes: Node[], file: string): Node | undefined {
 
 /** C and C++ classes named like the last segment of `segments` that the file at `site` can see. */
 function namedClasses(segments: readonly string[], site: CppNameSite, context: ResolutionContext, visible: (n: Node) => boolean): Node[] {
+  const kinds = site.declared ? TYPE_KINDS : CLASS_KINDS;
   return context
     .getNodesByName(segments[segments.length - 1]!)
-    .filter((n) => isCFamily(n) && CLASS_KINDS.has(n.kind) && n.id !== site.self?.id && visible(n));
+    .filter((n) => isCFamily(n) && kinds.has(n.kind) && n.id !== site.self?.id && visible(n));
 }
 
 /** A declaration's qualified name with the namespaces macros open around it: `fmt::detail::buffer` for `detail::buffer`. */
