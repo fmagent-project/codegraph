@@ -2,7 +2,7 @@ import { Node, Edge, ExtractionResult, ExtractionError, UnresolvedReference, Lan
 import { generateNodeId } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
 import { isLanguageSupported } from './grammars';
-import { foldScriptResult, sfcFileNode } from './sfc-script';
+import { foldScriptResult, sfcFileNode, sfcScriptLanguage, SFC_SCRIPT_ELEMENT, sfcBlockLineRanges } from './sfc-script';
 import { vueOptionsMembers } from './vue-options-api';
 import { vueTemplateCalls } from './vue-template-calls';
 
@@ -192,24 +192,27 @@ export class VueExtractor {
     content: string;
     startLine: number;
     isSetup: boolean;
-    isTypeScript: boolean;
+    language: Language;
   }> {
     const blocks: Array<{
       content: string;
       startLine: number;
       isSetup: boolean;
-      isTypeScript: boolean;
+      language: Language;
     }> = [];
 
-    const scriptRegex = /<script(\s[^>]*)?>(?<content>[\s\S]*?)<\/script>/g;
+    // A self-closing `<script src="./legacy.js" />` has no body; match it on
+    // its own so it cannot run on to the next block's `</script>`.
+    const scriptRegex = new RegExp(SFC_SCRIPT_ELEMENT);
     let match;
 
     while ((match = scriptRegex.exec(this.source)) !== null) {
+      if (match.groups?.content === undefined) continue;
       const attrs = match[1] || '';
-      const content = match.groups?.content || match[2] || '';
+      const content = match.groups.content;
 
-      // Detect TypeScript from lang attribute
-      const isTypeScript = /lang\s*=\s*["'](ts|typescript)["']/.test(attrs);
+      // TypeScript, TSX or JavaScript, from the lang attribute
+      const language = sfcScriptLanguage(attrs, 'vue');
 
       // Detect <script setup>
       const isSetup = /\bsetup\b/.test(attrs);
@@ -229,7 +232,7 @@ export class VueExtractor {
         content,
         startLine: contentStartLine,
         isSetup,
-        isTypeScript,
+        language,
       });
     }
 
@@ -240,10 +243,10 @@ export class VueExtractor {
    * Process a script block by delegating to TreeSitterExtractor
    */
   private processScriptBlock(
-    block: { content: string; startLine: number; isSetup: boolean; isTypeScript: boolean },
+    block: { content: string; startLine: number; isSetup: boolean; language: Language },
     componentNodeId: string
   ): void {
-    const scriptLanguage: Language = block.isTypeScript ? 'typescript' : 'javascript';
+    const scriptLanguage = block.language;
 
     // Check if the script language parser is available
     if (!isLanguageSupported(scriptLanguage)) {
@@ -288,15 +291,9 @@ export class VueExtractor {
     // Ranges covered by <script> / <style> blocks — skip them so script
     // identifiers and CSS selectors aren't mistaken for template tags. This
     // also correctly handles nested <template> tags (v-if / slots), which a
-    // single non-greedy <template>…</template> match would mis-bound.
-    const coveredRanges: Array<[number, number]> = [];
-    const blockRegex = /<(script|style)(\s[^>]*)?>[\s\S]*?<\/\1>/g;
-    let blockMatch;
-    while ((blockMatch = blockRegex.exec(this.source)) !== null) {
-      const startLine = (this.source.substring(0, blockMatch.index).match(/\n/g) || []).length;
-      const endLine = startLine + (blockMatch[0].match(/\n/g) || []).length;
-      coveredRanges.push([startLine, endLine]);
-    }
+    // single non-greedy <template>…</template> match would mis-bound. A
+    // self-closing `<script ... />` covers nothing.
+    const coveredRanges = sfcBlockLineRanges(this.source);
 
     const lines = this.source.split('\n');
     // Opening / self-closing tags (closing `</Foo>` starts with `</`, so the

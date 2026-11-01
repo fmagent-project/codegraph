@@ -16,6 +16,8 @@ import type CodeGraph from '../index';
 import { resolveServerRoot } from '../directory';
 import { ToolHandler } from './tools';
 import { WslSharedIndexError } from '../db/wsl-shared-index';
+import { DatabaseOpenError, isDatabaseOpenFailure } from '../db/open-error';
+import type { NodeSqliteUnavailableError } from '../db/node-sqlite';
 import { assertNoRebuild, releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
 import { QueryPool, resolvePoolSize } from './query-pool';
 import { endFreshnessMeasurements } from './index-freshness';
@@ -32,6 +34,15 @@ const loadCodeGraph = (): typeof import('../index').default =>
 
 /** How often the per-tool-call retry may re-run the sub-project down-scan. */
 const RETRY_SUBSCAN_TTL_MS = 5_000;
+
+/**
+ * Why the default project failed to open, when a tool call should say so
+ * rather than "no project loaded": the Windows/WSL shared index (#995), or an
+ * index that exists but SQLite could not open, or no node:sqlite at all.
+ */
+function reportableOpenFailure(err: unknown): WslSharedIndexError | DatabaseOpenError | NodeSqliteUnavailableError | null {
+  return err instanceof WslSharedIndexError || isDatabaseOpenFailure(err) ? err : null;
+}
 
 export interface MCPEngineOptions {
   /** Serve existing index contents without syncing, watching, or claiming a writer slot. */
@@ -80,6 +91,9 @@ export class MCPEngine {
   // Throttle for the retry path's sub-project down-scan (#1606) — the scan is
   // bounded but shouldn't run on every tool call in the no-default state.
   private lastRetrySubScanAt = 0;
+  // The default-root refusal last written to stderr, so the retry on every
+  // tool call doesn't repeat it.
+  private loggedRootRefusal: string | null = null;
   private watcherStarted = false;
   /** Set when this engine holds writer.pid (#1740). */
   private writerLockRoot: string | null = null;
@@ -236,6 +250,8 @@ export class MCPEngine {
       this.lastRetrySubScanAt = Date.now();
       if (!res.root) this.toolHandler.setKnownSubprojects(res.candidates, searchFrom);
     }
+    // An up-walk alone can't clear a refusal the throttled down-scan found.
+    if (scanDue || res.refusal) this.noteRootRefusal(res.refusal);
     const resolvedRoot = res.root;
     if (!resolvedRoot) return;
     if (res.viaSubScan) this.logSubprojectAdoption(searchFrom, resolvedRoot);
@@ -246,15 +262,26 @@ export class MCPEngine {
         this.cg = null;
       }
       assertNoRebuild(resolvedRoot);
-      this.cg = loadCodeGraph().openSync(resolvedRoot, { readOnly: this.opts.readOnly });
+      // Indexes an interrupted bulk load dropped are rebuilt off this thread
+      // (#1887); the catch-up and tool calls wait for them.
+      this.cg = loadCodeGraph().openSync(resolvedRoot, { readOnly: this.opts.readOnly, deferIndexRecovery: true });
       this.projectPath = resolvedRoot;
       this.toolHandler.setDefaultCodeGraph(this.cg);
       this.startWatching();
       this.catchUpSync();
-      this.maybeStartPool(resolvedRoot);
+      // The pool's workers open the project themselves: start them on a
+      // rebuilt one, not racing the rebuild for its write lock.
+      const opened = this.cg;
+      if (opened?.hasPendingIndexRecovery()) {
+        void opened.recoverIndexes().catch(() => { /* reported by the tool call waiting on it */ }).then(() => {
+          if (this.cg === opened) this.maybeStartPool(resolvedRoot);
+        });
+      } else {
+        this.maybeStartPool(resolvedRoot);
+      }
     } catch (err) {
       // Still failing — caller will try again on the next tool call.
-      this.toolHandler.setDefaultOpenFailure(err instanceof WslSharedIndexError ? err : null);
+      this.toolHandler.setDefaultOpenFailure(reportableOpenFailure(err));
     }
   }
 
@@ -351,15 +378,18 @@ export class MCPEngine {
     // only by knowing to look for a missing ~/.codegraph/daemons/ entry.
     const res = resolveServerRoot(searchFrom);
     const resolvedRoot = res.root;
+    this.noteRootRefusal(res.refusal);
     if (!resolvedRoot) {
       // Sessions may still discover a project later via roots/list, and the
       // per-call retry re-resolves — this state is recoverable, hence stderr
       // (not a failure) + candidates surfaced through the tool-call error.
       this.projectPath = searchFrom;
       this.toolHandler.setKnownSubprojects(res.candidates, searchFrom);
-      process.stderr.write(
-        `[CodeGraph MCP] No .codegraph/ at or above ${searchFrom}: no default project, live sync disabled until an indexed project is accessed via projectPath.\n`
-      );
+      if (!res.refusal) {
+        process.stderr.write(
+          `[CodeGraph MCP] No .codegraph/ at or above ${searchFrom}: no default project, live sync disabled until an indexed project is accessed via projectPath.\n`
+        );
+      }
       if (res.candidates.length > 0) {
         const rels = res.candidates.map((c) => path.relative(searchFrom, c) || '.');
         process.stderr.write(
@@ -385,8 +415,23 @@ export class MCPEngine {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`[CodeGraph MCP] Failed to open project at ${resolvedRoot}: ${msg}\n`);
       // The agent otherwise hears only "no project loaded" (#995).
-      this.toolHandler.setDefaultOpenFailure(err instanceof WslSharedIndexError ? err : null);
+      this.toolHandler.setDefaultOpenFailure(reportableOpenFailure(err));
     }
+  }
+
+  /**
+   * Record why the default project is refused (a sensitive folder, #2929's
+   * guard), or clear that. Tool calls without a projectPath say why there is
+   * no default project, and stderr says it once per reason, since every such
+   * call re-resolves.
+   */
+  private noteRootRefusal(refusal: string | null): void {
+    this.toolHandler.setDefaultRootRefusal(refusal);
+    if (!refusal || refusal === this.loggedRootRefusal) return;
+    this.loggedRootRefusal = refusal;
+    process.stderr.write(
+      `[CodeGraph MCP] ${refusal} — no default project, live sync disabled. Tool calls can still pass projectPath for a project elsewhere.\n`
+    );
   }
 
   /** One stderr line when the default project came from the down-scan (#1606). */

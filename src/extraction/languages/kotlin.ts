@@ -2,6 +2,21 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
+/** The visibility a Kotlin declaration's `modifiers` child spells out; public by default. */
+function kotlinVisibility(node: { childCount: number; child(i: number): { type: string; text: string } | null }): 'public' | 'private' | 'protected' | 'internal' {
+  for (let i = 0; i < node.childCount; i++) {
+    const child = node.child(i);
+    if (child?.type === 'modifiers') {
+      const text = child.text;
+      if (text.includes('public')) return 'public';
+      if (text.includes('private')) return 'private';
+      if (text.includes('protected')) return 'protected';
+      if (text.includes('internal')) return 'internal';
+    }
+  }
+  return 'public';
+}
+
 /** Kotlin return types that can't be a chained-call receiver (no class to chain on). */
 const KOTLIN_NON_CLASS_RETURN = new Set(['Unit', 'Nothing']);
 
@@ -162,6 +177,24 @@ function isFunInterfaceNode(node: SyntaxNode): boolean {
 }
 
 /**
+ * tree-sitter-kotlin predates functional interfaces (Kotlin 1.4): `fun
+ * interface Reply { … }` parses as a broken function declaration, and its
+ * error recovery swallows the NEXT declaration as well, so that interface and
+ * its methods go missing and its members surface as top-level functions.
+ * Blanking the `fun` of a `fun interface` declaration (three spaces for three
+ * letters, so every offset holds) lets it parse as the plain interface it is.
+ * Only a declaration position is touched: the start of a line, after optional
+ * visibility / multiplatform modifiers.
+ */
+export function blankKotlinFunInterface(source: string): string {
+  if (!source.includes('interface')) return source;
+  return source.replace(
+    /^([ \t]*(?:(?:public|private|internal|protected|expect|actual)[ \t]+)*)fun([ \t]+interface\b)/gm,
+    (_match, before: string, after: string) => `${before}   ${after}`,
+  );
+}
+
+/**
  * The qualifier of a function type's receiver — `DatabaseConfig.` in
  * `configure: (DatabaseConfig.Builder.() -> Unit)?`. The grammar reads a
  * single-segment receiver (`Builder.() -> Unit`) but not a qualified one, and
@@ -225,7 +258,7 @@ export function rewriteNewerKotlinSyntax(source: string): string {
 }
 
 function preParseKotlin(source: string): string {
-  return rewriteNewerKotlinSyntax(joinKotlinSplitConstructors(blankKotlinQualifiedReceivers(source)));
+  return rewriteNewerKotlinSyntax(joinKotlinSplitConstructors(blankKotlinQualifiedReceivers(blankKotlinFunInterface(source))));
 }
 
 export const kotlinExtractor: LanguageExtractor = {
@@ -282,7 +315,10 @@ export const kotlinExtractor: LanguageExtractor = {
       const sig = typeNode
         ? `${isVal ? 'val' : 'var'} ${name}: ${getNodeText(typeNode, ctx.source)}`
         : undefined;
-      const created = ctx.createNode(kind, name, node, { signature: sig });
+      // `private val` / `internal var` at class or object scope: the modifier
+      // decides who can name it from another file (#1731's Kotlin rule reads
+      // `visibility`, and a property without one read as public).
+      const created = ctx.createNode(kind, name, node, { signature: sig, visibility: kotlinVisibility(node) });
       // Walk the initializer ATTRIBUTED to the declared symbol (#693, the Go
       // fix, ported to Kotlin): the hook consumes this subtree, so without an
       // explicit walk a lambda / SAM / object initializer
@@ -293,12 +329,13 @@ export const kotlinExtractor: LanguageExtractor = {
       // grammar makes a following SIBLING rather than a child; those bodies used
       // to attribute to the enclosing class. Consumed here so the accessor
       // branch below can skip them without any cross-node state.
-      const inits = created
-        ? [...kotlinPropertyInitializers(node), ...kotlinFollowingAccessors(node)]
-        : [];
-      if (created && inits.length > 0) {
+      // The initializers are walked as such, so the dispatcher's
+      // function-as-value scan of the property skips them: it would take each
+      // function value again for the enclosing file or class.
+      if (created) {
         ctx.pushScope(created.id);
-        for (const init of inits) ctx.visitFunctionBody(init, created.id);
+        for (const init of kotlinPropertyInitializers(node)) ctx.walkInitializer(init, created.id);
+        for (const accessor of kotlinFollowingAccessors(node)) ctx.visitFunctionBody(accessor, created.id);
         ctx.popScope();
       }
       return true;
@@ -485,20 +522,7 @@ export const kotlinExtractor: LanguageExtractor = {
     }
     return sig;
   },
-  getVisibility: (node) => {
-    // Check for visibility modifiers in Kotlin
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
-      if (child?.type === 'modifiers') {
-        const text = child.text;
-        if (text.includes('public')) return 'public';
-        if (text.includes('private')) return 'private';
-        if (text.includes('protected')) return 'protected';
-        if (text.includes('internal')) return 'internal';
-      }
-    }
-    return 'public'; // Kotlin defaults to public
-  },
+  getVisibility: (node) => kotlinVisibility(node),
   isStatic: (_node) => {
     // Kotlin doesn't have static, uses companion objects
     return false;

@@ -22,16 +22,42 @@ import { resolveServerRoot } from '../directory';
 import { getTelemetry, ClientInfo } from '../telemetry';
 import { getUpdateNotice } from '../upgrade/update-check';
 import { ExploreSessionState } from './explore-session-state';
+import { IndexVersionWarningState } from './index-version-warning';
+
+/**
+ * The site's favicon on a light tile: the bare mark is dark ink on nothing,
+ * which a dark UI loses. Written out rather than as base64 so a reader can see
+ * it is two lines of shapes and nothing else.
+ */
+const SERVER_ICON_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke="#16150f" stroke-width="2">' +
+  '<rect width="32" height="32" rx="6" fill="#f7f6f2" stroke="none"/>' +
+  '<line x1="16" y1="8" x2="8" y2="23"/><line x1="16" y1="8" x2="24" y2="23"/><line x1="8" y1="23" x2="24" y2="23"/>' +
+  '<circle cx="16" cy="8" r="3.4" fill="#16150f"/><circle cx="8" cy="23" r="3.4" fill="#f7f6f2"/><circle cx="24" cy="23" r="3.4" fill="#f7f6f2"/>' +
+  '</svg>';
 
 /**
  * MCP Server Info — kept on the session because some clients log it. The
  * version tracks the real package version (was a hard-coded '0.1.0').
+ *
+ * `title` and `icons` are what a host may show in place of `name`. They are
+ * newer than the protocol version this server claims, so a host that doesn't
+ * know them passes over them. The icon has no `sizes`: it is optional and says
+ * nothing about an SVG, and a host on an SDK that typed it as a string, as 1.18
+ * did, would fail the whole handshake on the array the spec settled on.
  */
 // Exported so the proxy can answer `initialize` locally with the IDENTICAL
 // payload the daemon would send — no drift between the two handshake paths.
 export const SERVER_INFO = {
   name: 'codegraph',
+  title: 'CodeGraph',
   version: CodeGraphPackageVersion,
+  icons: [
+    {
+      src: `data:image/svg+xml;base64,${Buffer.from(SERVER_ICON_SVG).toString('base64')}`,
+      mimeType: 'image/svg+xml',
+    },
+  ],
 };
 
 /**
@@ -57,6 +83,23 @@ export function initializeInstructions(base: string, notice: string | null = get
 
 /** MCP Protocol Version (latest the server claims). */
 export const PROTOCOL_VERSION = '2024-11-05';
+
+/** The invalid-params message for {@link toolCallArguments}' null. */
+export const TOOL_ARGUMENTS_NOT_OBJECT = 'Tool arguments must be an object';
+
+/**
+ * The arguments a `tools/call` passes, or null when they are not an object.
+ * A string, number or array there is a malformed request, the client's to
+ * fix, so it is answered with a JSON-RPC invalid-params error, as a call that
+ * names no tool is, and never run: run, a string made the tool handler throw,
+ * which came back as an internal codegraph error to retry (#2981). Exported so
+ * the proxy, serving in process while the daemon is unavailable, answers it
+ * the same way. No arguments (missing, null or another empty value) are none.
+ */
+export function toolCallArguments(params: { arguments?: unknown }): Record<string, unknown> | null {
+  const args = params.arguments || {};
+  return typeof args === 'object' && !Array.isArray(args) ? (args as Record<string, unknown>) : null;
+}
 
 /**
  * How long to wait for the client's `roots/list` response before giving up
@@ -120,6 +163,8 @@ export class MCPSession {
    * the session — a reconnecting client starts clean.
    */
   private readonly exploreSession = new ExploreSessionState();
+  /** One-time stale-index warnings already delivered to this MCP client. */
+  private readonly indexVersionWarnings = new IndexVersionWarningState();
 
   constructor(
     private transport: JsonRpcTransport,
@@ -246,6 +291,8 @@ export class MCPSession {
     // sub-projects indexed) and never surfaced the tools after a mid-session
     // `codegraph init`. When no explicit path is known yet (roots/list dance
     // pending), cwd is the best predictor of where the default will resolve.
+    // A root in a sensitive folder resolves to null here as in the engine, so
+    // that session gets the no-default-project variant too.
     const indexed = resolveServerRoot(explicitPath ?? process.cwd()).root !== null;
 
     // Respond to the handshake BEFORE doing any heavy init — see issue #172.
@@ -294,7 +341,11 @@ export class MCPSession {
     }
 
     const toolName = params.name;
-    const toolArgs = params.arguments || {};
+    const toolArgs = toolCallArguments(params);
+    if (!toolArgs) {
+      this.transport.sendError(request.id, ErrorCodes.InvalidParams, TOOL_ARGUMENTS_NOT_OBJECT);
+      return;
+    }
 
     const tool = tools.find((t) => t.name === toolName);
     if (!tool) {
@@ -310,7 +361,12 @@ export class MCPSession {
     await this.retryInitIfNeeded();
 
     if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} dispatch\n`);
-    const result = await this.engine.getToolHandler().execute(toolName, toolArgs, this.exploreSession);
+    const result = await this.engine.getToolHandler().execute(
+      toolName,
+      toolArgs,
+      this.exploreSession,
+      this.indexVersionWarnings,
+    );
     if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} done\n`);
     this.transport.sendResult(request.id, result);
     // After the reply is on the wire — telemetry must never delay a tool
