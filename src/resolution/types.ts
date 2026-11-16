@@ -132,6 +132,12 @@ export interface ResolutionContext {
   /** `readFile(filePath)?.includes(needle) ?? false` for an ASCII `needle`, without decoding a file that lacks it. */
   fileContains?(filePath: string, needle: string): boolean;
   /**
+   * An indexed file's text for a walk over all of them, which keeps none: it
+   * stays out of the content cache, and each byte is a character, so anything
+   * outside ASCII reads wrongly. Null when the file can't be read.
+   */
+  scanFile?(filePath: string): string | null;
+  /**
    * `readFile(filePath)` split into lines, LRU-cached per file. Receiver-type
    * inference scans source lines for EVERY `receiver.method()` ref; splitting
    * the whole file per ref made that O(refs-in-file × file-size) — ~20% of
@@ -289,6 +295,12 @@ export interface ResolutionContext {
    * relative resolution fails. Optional so existing callers compile.
    */
   getCppIncludeDirs?(): string[];
+  /**
+   * The crates of the project's Cargo workspace, each spelling of a name →
+   * its member's directory. Optional so minimal contexts compile; they read
+   * the manifests themselves (see getCargoWorkspaceCrateMap).
+   */
+  getCargoCrates?(): Map<string, string>;
   /**
    * The import node of every C / C++ `#include`, narrowed to the path it
    * spells and where it is written: what ./cpp-includers builds the include

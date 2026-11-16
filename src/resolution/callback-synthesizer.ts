@@ -28,6 +28,7 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
 import { escapeRegExp } from '../utils';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
+import { cppTemplateArgumentEdges } from './cpp-template-instantiations';
 import { goframeRouteEdges } from './goframe-synthesizer';
 import { goFuncFieldEdges } from './go-func-field-synthesizer';
 import { expoRouterReturnEdges } from './expo-router-synthesizer';
@@ -983,6 +984,63 @@ export function goSignatureArity(signature: string | undefined): string | null {
   return parts ? `${parts.params.length}/${parts.results.length}` : null;
 }
 
+/** Words that start a Go type, in a parameter that could otherwise read as a name and its type. */
+const GO_TYPE_WORDS: ReadonlySet<string> = new Set(['func', 'chan', 'map', 'struct', 'interface']);
+
+/**
+ * The types of a Go parameter or result list's items: `ctx context.Context`
+ * is a `context.Context`, the `a` of `a, b int` an `int`, and in a list with
+ * no names each item is a type.
+ */
+function goItemTypes(items: readonly string[]): string[] {
+  const named = items.map((item) => {
+    const m = /^([A-Za-z_]\w*)\s+(\S[\s\S]*)$/.exec(item);
+    return m && !GO_TYPE_WORDS.has(m[1]!) ? m[2]! : null;
+  });
+  if (named.every((type) => type === null)) return [...items];
+  const types: string[] = [];
+  let type = '';
+  for (let i = items.length - 1; i >= 0; i--) types[i] = type = named[i] ?? type;
+  return types;
+}
+
+/**
+ * A Go type as two declarations can compare it: with no spaces or package
+ * qualifiers, as the two may sit in different packages and write `Context` and
+ * `caddy.Context`. Null for a type that holds a list of its own (a `func`, a
+ * `struct`), whose text differs by more than that.
+ */
+function goComparableType(written: string): string | null {
+  const flat = written.replace(/\s+/g, '').replace(/interface\{\}/g, 'any');
+  if (/\bfunc\(|\bstruct\{|\binterface\{/.test(flat)) return null;
+  return flat.replace(/[A-Za-z_]\w*\./g, '').replace(/\buint8\b/g, 'byte').replace(/\bint32\b/g, 'rune');
+}
+
+/** A Go method's parameter and result types, each as goComparableType gives it, one list. Null when the signature doesn't read. */
+function goMethodTypes(signature: string | undefined): Array<string | null> | null {
+  const parts = goSignatureParts(signature);
+  return parts ? [...goItemTypes(parts.params), ...goItemTypes(parts.results)].map(goComparableType) : null;
+}
+
+/** The source a Go type declaration starts with: its line, and the next two for a list that wraps. */
+function goDeclarationText(n: Node, ctx: ResolutionContext): string {
+  const lines = ctx.getFileLines?.(n.filePath) ?? ctx.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+  return lines.slice(n.startLine - 1, n.startLine + 2).join('\n');
+}
+
+/** The type parameters a Go type declares: `K` and `V` of `type Cache[K comparable, V any] struct`. */
+function goTypeParameterNames(n: Node, ctx: ResolutionContext): string[] {
+  const text = goDeclarationText(n, ctx);
+  const open = /^\s*(?:type\s+)?[A-Za-z_]\w*\s*\[/.exec(text);
+  const list = open ? goListItems(text, open[0].length - 1) : null;
+  return list ? list.items.flatMap((item) => /^[A-Za-z_]\w*/.exec(item)?.[0] ?? []) : [];
+}
+
+/** Whether a Go `type_alias` node is a true alias, `type A = B`, rather than a defined type. */
+function isGoTrueAlias(n: Node, ctx: ResolutionContext): boolean {
+  return /^\s*(?:type\s+)?[A-Za-z_]\w*\s*(?:\[[^\]]*\]\s*)?=/.test(goDeclarationText(n, ctx));
+}
+
 /**
  * The arity a gRPC server implements an RPC with, read off the signature the
  * generated client has for it. A unary call (`Range(ctx, in *RangeRequest,
@@ -1058,11 +1116,19 @@ function goGrpcServerArity(signature: string | undefined): string | null {
  * (see `wantedArities`), the bridge a client's call crosses to reach its
  * handler.
  *
- * Types are not compared, and a promoted name counts even where Go finds it
- * ambiguous or hidden by a field — over-approximation accepted, in line with
- * the other dispatch synthesizers; capped per interface. Empty interfaces
- * (`any`) are skipped so they don't match every type, and a struct that
- * embeds the interface keeps the edge its embedding already is.
+ * At those counts its types must be the interface's too, each by its name with
+ * the package left off, since the two may sit in different packages (see
+ * `typesFit`): caddy's TLS `MatchServerName`, with `Match(*tls.ClientHelloInfo)
+ * bool`, is no HTTP `RequestMatcher`, whose `Match` takes an `*http.Request`.
+ * A true alias, a declaration's type parameter and a type that holds a list of
+ * its own rule nothing out, nor does a method a standard-library embedding
+ * brings.
+ *
+ * A promoted name counts even where Go finds it ambiguous or hidden by a field
+ * — over-approximation accepted, in line with the other dispatch synthesizers;
+ * capped per interface. Empty interfaces (`any`) are skipped so they don't
+ * match every type, and a struct that embeds the interface keeps the edge its
+ * embedding already is.
  */
 async function goImplementsEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   let scanned255 = 0;
@@ -1287,6 +1353,68 @@ async function goImplementsEdges(queries: QueryBuilder, ctx: ResolutionContext, 
     return true;
   };
 
+  // Each method in a type's method set → the types of its declarations there;
+  // null when one of them doesn't read or a standard-library embedding brings
+  // it, whose types the table doesn't hold. Built only for the pairs whose
+  // counts already fit.
+  const typesMemo = new Map<string, Map<string, Array<Array<string | null>> | null>>();
+  const methodTypes = (id: string): Map<string, Array<Array<string | null>> | null> => {
+    let types = typesMemo.get(id);
+    if (types) return types;
+    types = new Map();
+    for (const t of embedClosure(id)) {
+      ownMethods(t);
+      for (const [name, signatures] of ownSignatures.get(t) ?? []) {
+        let known = types.get(name);
+        if (known === null) continue;
+        if (!known) types.set(name, (known = []));
+        for (const signature of signatures) {
+          const read = goMethodTypes(signature);
+          if (!read) {
+            types.set(name, null);
+            break;
+          }
+          known.push(read);
+        }
+      }
+      for (const methods of outside.get(t)?.stdlib ?? []) for (const name of methods.keys()) types.set(name, null);
+    }
+    typesMemo.set(id, types);
+    return types;
+  };
+  // The names that stand for some other type: the project's true aliases, and
+  // the type parameters of a type or of what it embeds.
+  let aliases: Set<string> | undefined;
+  const parameterMemo = new Map<string, string[]>();
+  const typeParameters = (id: string): string[] => {
+    let names = parameterMemo.get(id);
+    if (!names) {
+      const type = queries.getNodeById(id);
+      parameterMemo.set(id, (names = type ? goTypeParameterNames(type, ctx) : []));
+    }
+    return names;
+  };
+  // Go wants each method's types to be the interface's. A declaration at
+  // another count is the gRPC server `wantedArities` lets through: the
+  // parameters are its service's, not the client's.
+  const typesFit = (s: Node, iface: Node): boolean => {
+    aliases ??= new Set(goImplementers.filter((n) => n.kind === 'type_alias' && isGoTrueAlias(n, ctx)).map((n) => n.name));
+    const known = aliases;
+    const parameters = new Set([...embedClosure(s.id), ...embedClosure(iface.id)].flatMap(typeParameters));
+    const open = (type: string | null): boolean => type === null ||
+      type.split(/\W+/).some((word) => known.has(word) || parameters.has(word));
+    const sameType = (a: string | null, b: string | null): boolean => a === b || open(a) || open(b);
+    const have = methodTypes(s.id);
+    for (const [name, wantedTypes] of methodTypes(iface.id)) {
+      const got = have.get(name);
+      if (!wantedTypes || !got) continue;
+      const fits = wantedTypes.some((want) => got.some((type) =>
+        type.length !== want.length || type.every((t, i) => sameType(t, want[i]!))));
+      if (!fits) return false;
+    }
+    return true;
+  };
+
   // A type without a method, or an embedded type nothing describes, satisfies
   // no interface this pass looks at.
   const candidates: Node[] = [];
@@ -1334,7 +1462,7 @@ async function goImplementsEdges(queries: QueryBuilder, ctx: ResolutionContext, 
       const have = candidateMethods.get(s.id)!;
       if (!covers(have.methods, want.methods)) continue;
       if (!wanted) wanted = wantedArities(iface);
-      if (!aritiesFit(s.id, wanted)) continue;
+      if (!aritiesFit(s.id, wanted) || !typesFit(s, iface)) continue;
       covering++;
       if (embeds(s.id).includes(iface.id)) continue; // declared by embedding it
       if (!coversOpaque(have, want)) {
@@ -5186,7 +5314,7 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
   // A Next proxy and the routes its matcher covers are joined by path and config, not by any line of code.
   if (NEXT_PROXY_FILE.test(filePath) || nextRouteForFile(filePath) !== null) return true;
   if (/\.(?:c|h|cc|cpp|cxx|hpp|hh|hxx|cppm|ipp|inl|tcc|def|inc|tbl)$/i.test(filePath) &&
-    /\b(?:struct|union|typedef|virtual|override)\b|#\s*(?:include|define|if)|=|->|\[/.test(content)) return true;
+    /\b(?:struct|union|typedef|virtual|override)\b|#\s*(?:include|define|if)|=|->|\[|</.test(content)) return true;
   if (/\b(?:class|interface|protocol|trait|impl|extends|implements|expect|actual)\b/.test(content)) return true;
   // Every Go file: besides the declarations the interface passes read, a call
   // through a func field, or a function put in one, can sit in any of them.
@@ -5293,6 +5421,9 @@ export const SYNTH_PASSES: SynthPassDef[] = [
     gate: (has) => has('c', 'cpp'),
     run: (q, c, y, sub) => cFnPointerDispatchEdges(q, c, y, sub),
   },
+  // `Txn::Put(…)` in `template <typename Txn> class Mixin` onto each class the project writes as `Txn`.
+  // After the other C++ passes: a pair one of them bridges keeps its edge.
+  { name: 'cppTemplateEdges', gate: (has) => has('cpp'), run: (q, c, y) => cppTemplateArgumentEdges(q, c, y) },
   { name: 'goframeEdges', gate: (has) => has('go'), run: (_q, c, y) => goframeRouteEdges(c, y) },
   // `d.refreshf(ctx)` onto the functions put in that func field (`RefreshF: d.refresh`).
   // After the Go framework passes: a pair one of them bridges keeps its more specific edge.
