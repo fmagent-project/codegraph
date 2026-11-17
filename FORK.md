@@ -3,13 +3,16 @@
 FM-Agent's maintenance fork of
 [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph).
 
-**Pinned base:** upstream `d2e0389` (`main`, 2026-11-01) — an untagged commit past
+**Pinned base:** upstream `329dd12` (`main`, 2026-11-15) — an untagged commit past
 `v1.6.2`, the exception the policy below allows: upstream has tagged nothing since
-`v1.6.2` (2026-10-03). This sync is for call resolution `main` gained after the
-previous base: Rust receiver types (`Box`/`Rc`/`Pin` self, `as_mut`, loop and tuple
-bindings, field chains, trait-bounded generics), which link about 900 more of
-ripgrep's calls, and calls on library and built-in values no longer landing on a
-same-named project method, in every language FM-Agent reads.
+`v1.6.2` (2026-10-03). This sync is for Java call resolution `main` gained after the
+previous base: a call reaches the overload its arguments fit, a lambda or method
+reference the overload that takes a function, and what a class inherits no longer
+depends on resolve order. Java is the language FM-Agent reads through CodeGraph
+alone. Against the calls recorded while each project's own tests run, recall rises
+1.4–3.6 points and estimated precision 2.1–3.8 points on jsoup, gson,
+commons-collections and jackson-databind. On the other languages FM-Agent reads, no
+compared project changes by more than two edges.
 
 It carries this project's
 [PR #1865](https://github.com/colbymchenry/codegraph/pull/1865) for Dart 3
@@ -29,17 +32,16 @@ wrappers nothing binds, and calls into a service's members. Measured on
 `sst/opencode` (`df23b7f`) by source position, upstream alone reaches 1,017 of the
 1,055 `Effect.fn*("…")(function…)` sites; with patch 2, all 1,055.
 
-The previous base was `10e316d` (`main`, 2026-10-19), 354 commits behind this point,
-none of them merges. None of the patches below was taken upstream in that span.
-Patches 1–4 merged back without a conflict and are byte for byte what they were.
+The previous base was `d2e0389` (`main`, 2026-11-01), 21 commits behind this point,
+none of them merges. None of the patches below was taken upstream in that span, and
+all five merged back without a conflict, byte for byte what they were.
 Upstream's generator fix ([#1741](https://github.com/colbymchenry/codegraph/issues/1741))
 still stops short in one place — the two helpers that read a class field's value do
 not list `generator_function`, on either extraction path — so patch 4 stays.
-Patch 5 conflicted only by position: upstream added
-`blankCUnbalancedConditionalBranches` (`cbd9817`) beside it in `c-cpp.ts`. That
-pass now keeps an `else if` written across a directive inside its function, which
-patch 5 also does, but it leaves a function whose `#if`/`#else` branches each
-carry a header unindexed: 10 of the patch's 14 behaviour cases fail on upstream
+Upstream's `blankCUnbalancedConditionalBranches` (`cbd9817`), beside patch 5 in
+`c-cpp.ts`, keeps an `else if` written across a directive inside its function, which
+patch 5 also does, but it leaves a function whose `#if`/`#else` branches each carry
+a header unindexed: 10 of the patch's 14 behaviour cases still fail on upstream
 alone. Both passes run, patch 5's first, before the directive snapshot.
 
 Upstream shipped the C macro-attribute extraction fix (issue #1211, PR #1311) in
@@ -104,10 +106,9 @@ Windows file swap prints when it cannot put files back (`Install-CodeGraphFiles`
 a test keeps identical). `install.sh`'s hint for Windows shells still names
 upstream's `install.ps1`, as before: `__tests__/installer-targets.test.ts` pins it.
 
-**Verifying a sync:** besides `npm test`, run
-[`fmagent-project/codegraph-benchmark`](https://github.com/fmagent-project/codegraph-benchmark)
-(`make check`): one case per extraction bug FM-Agent has hit, upstream's and these
-patches', each of which fails on a build that lacks the fix.
+**Verifying a sync:** besides `npm test`, run the fork's regression cases: one case
+per extraction bug FM-Agent has hit, upstream's and these patches', each of which
+fails on a build that lacks the fix.
 
 **Releases:** tagged `vX.Y.Z-fmagent.N`, each carrying self-contained per-OS
 bundles (darwin/linux/windows, arm64/x64) with the native Rust extraction

@@ -396,9 +396,13 @@ function exportedByName(filePath: string, idx: FileExportIndex, name: string, co
   return idx.clauseAliases.get(name);
 }
 
+/** Per context: an include path, by language → where the project's include directories find it. */
+const cppIncludeSearches = new WeakMap<ResolutionContext, Map<string, string | null>>();
+
 /** Drop the per-context memo tables (see ReferenceResolver.clearCaches). */
 export function clearImportResolverMemos(context: ResolutionContext): void {
   importPathMemos.delete(context);
+  cppIncludeSearches.delete(context);
   exportedSymbolMemos.delete(context);
   fileExportIndexes.delete(context);
   luaFileBasenameIndexes.delete(context);
@@ -1708,69 +1712,33 @@ function namesOwnConfigModule(importPath: string, fromFile: string, language: La
 }
 
 /**
- * C/C++ include directory cache (keyed by project root).
- * Loaded once per resolver instance, shared across calls.
+ * The Clang compilation databases a project can have, relative to its root,
+ * the first one found being the one read.
  */
-const cppIncludeDirCache = new Map<string, string[]>();
+export const CPP_COMPILE_DB_FILES = [
+  'compile_commands.json',
+  'build/compile_commands.json',
+  'cmake-build-debug/compile_commands.json',
+  'cmake-build-release/compile_commands.json',
+  'out/compile_commands.json',
+] as const;
 
 /**
- * Clear the C/C++ include directory cache (call between indexing runs)
- */
-export function clearCppIncludeDirCache(): void {
-  cppIncludeDirCache.clear();
-}
-
-/**
- * Discover C/C++ include search directories for a project.
- *
- * Strategy:
- * 1. Look for compile_commands.json (Clang compilation database) in the
- *    project root and common build subdirectories. Parse -I and -isystem
- *    flags from compiler commands.
- * 2. If no compilation database is found, probe for common convention
- *    directories (include/, src/, lib/, api/) and top-level directories
- *    containing .h/.hpp files.
- *
- * Returns paths relative to projectRoot.
- */
-export function loadCppIncludeDirs(projectRoot: string): string[] {
-  const cached = cppIncludeDirCache.get(projectRoot);
-  if (cached !== undefined) return cached;
-
-  const dirs = loadCppIncludeDirsFromCompileDB(projectRoot)
-    || loadCppIncludeDirsHeuristic(projectRoot);
-
-  cppIncludeDirCache.set(projectRoot, dirs);
-  return dirs;
-}
-
-/**
- * Try to load include directories from compile_commands.json.
+ * The C/C++ include search directories a project's compile_commands.json
+ * names, by its -I and -isystem flags, relative to projectRoot.
  * Returns null if no compilation database is found (so the heuristic
  * fallback can run). Returns an array (possibly empty) otherwise.
  */
-function loadCppIncludeDirsFromCompileDB(projectRoot: string): string[] | null {
-  const candidates = [
-    path.join(projectRoot, 'compile_commands.json'),
-    path.join(projectRoot, 'build', 'compile_commands.json'),
-    path.join(projectRoot, 'cmake-build-debug', 'compile_commands.json'),
-    path.join(projectRoot, 'cmake-build-release', 'compile_commands.json'),
-    path.join(projectRoot, 'out', 'compile_commands.json'),
-  ];
-
-  let dbPath: string | undefined;
-  for (const c of candidates) {
-    try {
-      if (fs.existsSync(c)) {
-        dbPath = c;
-        break;
-      }
-    } catch {
-      // ignore
-    }
+export function loadCppIncludeDirsFromCompileDB(projectRoot: string): string[] | null {
+  for (const file of CPP_COMPILE_DB_FILES) {
+    const dbPath = path.join(projectRoot, file);
+    if (fs.statSync(dbPath, { throwIfNoEntry: false })?.isFile()) return readCompileDbIncludeDirs(dbPath, projectRoot);
   }
-  if (!dbPath) return null;
+  return null;
+}
 
+/** The include directories the compilation database at `dbPath` names; null when it can't be read. */
+export function readCompileDbIncludeDirs(dbPath: string, projectRoot: string): string[] | null {
   try {
     const content = fs.readFileSync(dbPath, 'utf-8');
     const entries = JSON.parse(content) as Array<{
@@ -1858,7 +1826,7 @@ function shlexSplit(cmd: string): string[] {
  * Heuristic include directory discovery when no compile_commands.json exists.
  * Checks common convention directories and scans top-level dirs for headers.
  */
-function loadCppIncludeDirsHeuristic(projectRoot: string): string[] {
+export function loadCppIncludeDirsHeuristic(projectRoot: string): string[] {
   const dirs: string[] = [];
   const conventionDirs = ['include', 'src', 'lib', 'api', 'inc'];
 
@@ -1894,6 +1862,21 @@ function loadCppIncludeDirsHeuristic(projectRoot: string): string[] {
  * Called as a fallback after relative and aliased resolution fail.
  */
 function resolveCppIncludePath(
+  importPath: string,
+  language: Language,
+  context: ResolutionContext
+): string | null {
+  // (The search doesn't depend on the including file, and a project's files
+  // include one header from hundreds of places.)
+  let memo = cppIncludeSearches.get(context);
+  if (!memo) cppIncludeSearches.set(context, (memo = new Map()));
+  const key = `${language}\0${importPath}`;
+  let found = memo.get(key);
+  if (found === undefined) memo.set(key, (found = searchCppIncludeDirs(importPath, language, context)));
+  return found;
+}
+
+function searchCppIncludeDirs(
   importPath: string,
   language: Language,
   context: ResolutionContext
@@ -2518,17 +2501,6 @@ function extractCppImports(content: string): ImportMapping[] {
   return mappings;
 }
 
-// Cache import mappings per file to avoid re-reading and re-parsing
-const importMappingCache = new Map<string, ImportMapping[]>();
-
-/**
- * Clear the import mapping cache (call between indexing runs)
- */
-export function clearImportMappingCache(): void {
-  importMappingCache.clear();
-  cppIncludeDirCache.clear();
-}
-
 /**
  * Strip JS line + block comments from `content` while preserving
  * string literals (so `"//"` inside a string stays intact). A block
@@ -2713,10 +2685,9 @@ export function resolveJvmImport(
   // FQN across source sets (commonMain / androidMain / appleMain). Taking the
   // first candidate let a single platform `actual` absorb every common-side
   // import, so the `expect` (the canonical API a commonMain file imports)
-  // looked unused. Prefer the candidate CLOSEST to the importing file by
-  // directory proximity — a commonMain import resolves to the commonMain
-  // declaration — with the `expect` side as a tiebreak.
-  const best = candidates.length === 1 ? candidates[0]! : pickClosestJvmCandidate(candidates, ref.filePath);
+  // looked unused. A commonMain import resolves to the commonMain declaration,
+  // a platform's to its `actual` (pickJvmDeclaration).
+  const best = candidates.length === 1 ? candidates[0]! : pickJvmDeclaration(candidates, ref);
   return {
     original: ref,
     targetNodeId: best.id,
@@ -2774,6 +2745,51 @@ function pickClosestJvmCandidate(candidates: Node[], fromPath: string): Node {
     }
   }
   return best;
+}
+
+/** The source set a file is in: `androidMain` of `lib/src/androidMain/kotlin/a/Util.kt`; null outside any `src/<set>/`. */
+function kmpSourceSet(filePath: string): string | null {
+  return /(?:^|\/)src\/([^/]+)\//.exec(filePath)?.[1] ?? null;
+}
+
+/** What a source set builds for: `android` of `androidMain` and `androidUnitTest`, `common` of `commonTest`. */
+function kmpBuildTarget(set: string): string {
+  return set.replace(/(?:Main|(?:Unit|Instrumented|Device|Host)?Test)$/, '');
+}
+
+/** Kotlin Multiplatform targets that build for the JVM. */
+const KMP_JVM_TARGET = /^(?:android|jvm|desktop)/;
+
+/**
+ * Which of a declaration's same-named Kotlin Multiplatform declarations a JVM
+ * reference reaches. A file compiled for common code sees the `expect`, so
+ * commonMain and commonTest keep the nearest declaration, the `expect` on a
+ * tie. Anything built for a platform sees the `actual`: Kotlin of that target's
+ * source sets its own (an androidUnitTest the androidMain one) or that of a
+ * target it builds on (`iosArm64Main` from `iosMain`), and with neither the
+ * `expect`, as an intermediate source set does. Java, and a Kotlin module with
+ * no source sets of its own, run against JVM bytecode, where no `expect` exists:
+ * timber's Java sample calling `Timber.plant(…)` is the `androidMain` `actual`,
+ * never an `iosMain` one. Of the JVM's targets the one its path names, else not
+ * Android's: okhttp's samples are `jvmMain`'s, its `android-test` `androidMain`'s.
+ */
+function pickJvmDeclaration(declarations: Node[], ref: UnresolvedRef): Node {
+  const actuals = declarations.filter((n) => n.decorators?.includes('actual'));
+  if (actuals.length === 0 || actuals.length === declarations.length) return pickClosestJvmCandidate(declarations, ref.filePath);
+  const set = kmpSourceSet(ref.filePath);
+  const target = set === null ? null : kmpBuildTarget(set);
+  const targetOf = (n: Node): string => kmpBuildTarget(kmpSourceSet(n.filePath) ?? '');
+  if (target?.startsWith('common') || (target === null && ref.language !== 'java')) return pickClosestJvmCandidate(declarations, ref.filePath);
+  const own = actuals.filter((n) => targetOf(n) === target);
+  if (own.length > 0) return pickClosestJvmCandidate(own, ref.filePath);
+  if (ref.language === 'java' || target === 'main' || target === 'test') {
+    const jvm = actuals.filter((n) => KMP_JVM_TARGET.test(targetOf(n)));
+    const android = /android/i.test(ref.filePath);
+    const named = jvm.filter((n) => targetOf(n).startsWith('android') === android);
+    return pickClosestJvmCandidate(named.length > 0 ? named : jvm.length > 0 ? jvm : actuals, ref.filePath);
+  }
+  const above = actuals.filter((n) => targetOf(n) !== '' && target!.startsWith(targetOf(n)));
+  return pickClosestJvmCandidate(above.length > 0 ? above : declarations, ref.filePath);
 }
 
 /**
@@ -4119,7 +4135,7 @@ function resolveJavaImportedReference(
     const callOfFunction = matchesBare && ref.referenceKind === 'calls' &&
       named.some((n) => n.kind === 'function' || n.kind === 'method');
     if (declarations.length > 0 && !callOfFunction) {
-      const owner = declarations.length === 1 ? declarations[0]! : pickClosestJvmCandidate(declarations, ref.filePath);
+      const owner = declarations.length === 1 ? declarations[0]! : pickJvmDeclaration(declarations, ref);
       const target = jvmImportedMember(owner, memberPath, ref, context);
       // Of a member's overloads, the one the call's argument count fits:
       // `ItemStack.Hash.of(stack, registries)`, not `of(stack)`.

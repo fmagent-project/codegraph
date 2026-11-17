@@ -842,6 +842,7 @@ export class CodeGraph {
           const tDeferred = Date.now();
           await this.resolver.resolveDeferredThisMemberRefs();
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[synth-timing] deferredThisMember: ${Date.now() - tDeferred}ms`);
+          await this.resolver.resolveParameterFlows();
         }
 
         // Over an existing graph the vocabulary was kept (see the top of the
@@ -1009,7 +1010,7 @@ export class CodeGraph {
   private stampModuleConfigSnapshot(): void {
     try {
       const stored = this.queries.getMetadata(MODULE_CONFIG_METADATA_KEY);
-      this.queries.setMetadata(MODULE_CONFIG_METADATA_KEY, JSON.stringify(this.resolver.getModuleConfigSnapshot(stored)));
+      this.queries.setMetadata(MODULE_CONFIG_METADATA_KEY, JSON.stringify(this.resolver.getModuleConfigSnapshot(stored, true)));
     } catch { /* metadata is advisory */ }
   }
 
@@ -1110,6 +1111,7 @@ export class CodeGraph {
     const {
       ESM_IMPORT_LANGUAGES,
       aliasMayName,
+      changedModuleConfigs,
       changedRoutes,
       createImportReader,
       hasSynthesisPattern,
@@ -1220,8 +1222,10 @@ export class CodeGraph {
         // routes. Compared with the routes after runPostExtract below.
         const watchRoutes = this.resolver.hasNavigationRouters();
         let routesBefore = null as Node[] | null;
+        const flowChange = this.resolver.trackParameterFlows();
         const result = await this.orchestrator.sync(options.onProgress, options.paths, backpressure,
           (filePath, content) => {
+            flowChange.before(filePath);
             if (watchRoutes && routesBefore === null) routesBefore = this.queries.getNodesByKind('route');
             if (!refreshSynthesis && (this.queries.hasSynthesizedEdgesTouchingFile(filePath) ||
               this.queries.wasSynthesisInput(filePath) ||
@@ -1316,14 +1320,14 @@ export class CodeGraph {
         // (`extends` chains included) plus the root's candidates; when one
         // differs, the maps are dropped and every import the file governs is
         // re-opened for the sweep below, as a moved workspace map re-opens
-        // the ES-module imports. A handful of small files, read on every sync.
+        // the ES-module imports. Cargo manifests and a compile database count
+        // too. Looked at on every sync, read only when one's stamp moved.
         // An index stamped by an older engine has no snapshot: record one.
         {
           const tConfig = Date.now();
           const stored = this.queries.getMetadata(MODULE_CONFIG_METADATA_KEY);
-          const snapshot = this.resolver.getModuleConfigSnapshot(stored);
-          const was = parseModuleConfigSnapshot(stored);
-          const changed = stored === null ? [] : Object.keys(snapshot).filter((rel) => (was[rel] ?? 'absent') !== snapshot[rel]);
+          const snapshot = this.resolver.getModuleConfigSnapshot(stored, result.filesAdded > 0 || result.filesRemoved > 0);
+          const changed = stored === null ? [] : changedModuleConfigs(parseModuleConfigSnapshot(stored), snapshot);
           if (changed.length > 0) {
             this.resolver.resetModuleConfig();
             let reopened = 0;
@@ -1820,6 +1824,12 @@ export class CodeGraph {
             this.lastSynthesisAt = Date.now();
             synthesized = true;
           }
+        }
+
+        // A call in one file types a parameter in another, so an edit of the
+        // caller can move the callee's edges. Last, as in a full index.
+        if (filesChanged || result.filesRemoved > 0 || orphanCount > 0) {
+          await this.resolver.resolveParameterFlows(flowChange);
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
