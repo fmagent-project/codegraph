@@ -106,10 +106,9 @@ Windows file swap prints when it cannot put files back (`Install-CodeGraphFiles`
 a test keeps identical). `install.sh`'s hint for Windows shells still names
 upstream's `install.ps1`, as before: `__tests__/installer-targets.test.ts` pins it.
 
-**Verifying a sync:** besides `npm test`, run
-[`fmagent-project/codegraph-benchmark`](https://github.com/fmagent-project/codegraph-benchmark)
-(`make check`): one case per extraction bug FM-Agent has hit, upstream's and these
-patches', each of which fails on a build that lacks the fix.
+**Verifying a sync:** besides `npm test`, run the fork's regression cases: one case
+per extraction bug FM-Agent has hit, upstream's and these patches', each of which
+fails on a build that lacks the fix.
 
 **Releases:** tagged `vX.Y.Z-fmagent.N`, each carrying self-contained per-OS
 bundles (darwin/linux/windows, arm64/x64) with the native Rust extraction
